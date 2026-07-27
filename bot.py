@@ -44,7 +44,7 @@ except ValueError:
 
 # ================== تنظیمات قابل تغییر ==================
 DEFAULT_MAX_ALLOWED_IPS = 8
-CHECK_INTERVAL_SECONDS = 600       # هر ۱۰ دقیقه بررسی خودکار
+DEFAULT_CHECK_INTERVAL_MINUTES = 15  # فاصله‌ی بررسی خودکار (دقیقه) - قابل تغییر از داخل ربات
 ALERT_COOLDOWN_SECONDS = 1800      # هر یوزر حداکثر هر ۳۰ دقیقه یک بار هشدار بگیره
 ONLINE_WINDOW_SECONDS = 120        # یوزر رو "آنلاین" حساب کن اگه online_at توی این بازه بوده
 REQUEST_TIMEOUT = 15
@@ -81,6 +81,7 @@ runtime = {
     "panel_token": None,
     "panel_token_time": 0,
     "max_allowed_ips": DEFAULT_MAX_ALLOWED_IPS,
+    "check_interval_minutes": DEFAULT_CHECK_INTERVAL_MINUTES,
     "check_history": [],
     "pending_action": {},   # chat_id -> "set_limit" | "check_user" | "set_panel_url" | "set_panel_username" | "set_panel_password"
 }
@@ -123,6 +124,7 @@ def load_state():
             runtime["alert_state"] = saved.get("alert_state", {})
             runtime["working_endpoint"] = saved.get("working_endpoint")
             runtime["max_allowed_ips"] = saved.get("max_allowed_ips", DEFAULT_MAX_ALLOWED_IPS)
+            runtime["check_interval_minutes"] = saved.get("check_interval_minutes", DEFAULT_CHECK_INTERVAL_MINUTES)
             runtime["check_history"] = saved.get("check_history", [])
         except Exception:
             pass
@@ -134,6 +136,7 @@ def save_state():
             "alert_state": runtime["alert_state"],
             "working_endpoint": runtime["working_endpoint"],
             "max_allowed_ips": runtime["max_allowed_ips"],
+            "check_interval_minutes": runtime["check_interval_minutes"],
             "check_history": runtime["check_history"][-HISTORY_KEEP:],
         }))
     except Exception as e:
@@ -314,13 +317,14 @@ def tg_answer_callback(callback_id, text=""):
 def main_menu_keyboard():
     return {
         "inline_keyboard": [
-            [{"text": "🔍 بررسی الان", "callback_data": "check_now"},
+            [{"text": "🔍 الان بررسی کن", "callback_data": "check_now"},
              {"text": "🔎 بررسی یوزر خاص", "callback_data": "check_user"}],
             [{"text": "⚙️ حد مجاز IP", "callback_data": "set_limit"},
-             {"text": "🕐 تاریخچه", "callback_data": "history"}],
-            [{"text": "🧪 تست اتصال API", "callback_data": "test_api"},
-             {"text": "ℹ️ وضعیت", "callback_data": "status"}],
-            [{"text": "🛠 تنظیمات پنل", "callback_data": "panel_menu"}],
+             {"text": "⏱ فاصله بررسی", "callback_data": "set_interval"}],
+            [{"text": "🕐 تاریخچه", "callback_data": "history"},
+             {"text": "🧪 تست اتصال API", "callback_data": "test_api"}],
+            [{"text": "ℹ️ وضعیت", "callback_data": "status"},
+             {"text": "🛠 تنظیمات پنل", "callback_data": "panel_menu"}],
         ]
     }
 
@@ -378,7 +382,8 @@ NEXT_PROMPT = {
 def start_panel_setup_wizard(chat_id):
     tg_send(
         "🔌 جهت اتصال به پنل، آدرس پنل خودت رو بدون path (همون آدرس داشبورد) بفرست:\n"
-        "مثلاً: https://panel.example.com",
+        "مثلاً: https://panel.example.com\n"
+        "اگه پنلت روی یه پورت خاص هست، پورت رو هم بعد از آدرس بذار، مثلاً: https://panel.example.com:2096",
         chat_id=chat_id,
     )
     runtime["pending_action"][chat_id] = "setup_url"
@@ -410,6 +415,16 @@ def handle_panel_field_reply(chat_id, pending, text):
         try:
             get_panel_token(force=True)
             tg_send("✅ به پنل متصل شد!", chat_id=chat_id, reply_markup=main_menu_keyboard())
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 401:
+                tg_send(
+                    "❌ اتصال ناموفق: یوزرنیم یا پسورد اشتباهه (خطای 401 Unauthorized).\n"
+                    "از «🛠 تنظیمات پنل» دوباره وارد کن.",
+                    chat_id=chat_id, reply_markup=main_menu_keyboard(),
+                )
+            else:
+                tg_send(f"❌ اتصال ناموفق: {e}\nاز «🛠 تنظیمات پنل» می‌تونی دوباره امتحان کنی.",
+                        chat_id=chat_id, reply_markup=main_menu_keyboard())
         except Exception as e:
             tg_send(f"❌ اتصال ناموفق: {e}\nاز «🛠 تنظیمات پنل» می‌تونی دوباره امتحان کنی.",
                     chat_id=chat_id, reply_markup=main_menu_keyboard())
@@ -522,6 +537,7 @@ def handle_status(chat_id):
         f"🟢 وضعیت اسکریپت: فعال\n"
         f"🛠 وضعیت پنل: {'متصل ✅' if panel_is_configured() else 'تنظیم نشده ❌'}\n"
         f"📊 حد مجاز IP: {runtime['max_allowed_ips']}\n"
+        f"⏱ فاصله بررسی خودکار: هر {runtime['check_interval_minutes']} دقیقه\n"
         f"⚠️ یوزرهای بالای حد در آخرین بررسی: {over_str}",
         chat_id=chat_id,
     )
@@ -559,6 +575,38 @@ def handle_set_limit_reply(chat_id, text):
     runtime["max_allowed_ips"] = val
     save_state()
     tg_send(f"✅ حد مجاز IP روی {val} تنظیم شد.", chat_id=chat_id, reply_markup=main_menu_keyboard())
+
+
+def handle_set_interval_prompt(chat_id):
+    runtime["pending_action"][chat_id] = "set_interval"
+    tg_send(
+        f"تعیین کنید ربات هر چند دقیقه IP یوزرهای آنلاین پنل رو بررسی کنه.\n"
+        f"الان: هر {runtime['check_interval_minutes']} دقیقه\n"
+        f"یکی از گزینه‌های پیشنهادی رو انتخاب کن یا یه عدد دلخواه (به دقیقه) بفرست:",
+        chat_id=chat_id,
+        reply_markup={
+            "inline_keyboard": [
+                [{"text": "5", "callback_data": "interval_5"},
+                 {"text": "10 (پیشنهادی)", "callback_data": "interval_10"}],
+                [{"text": "15", "callback_data": "interval_15"},
+                 {"text": "30", "callback_data": "interval_30"}],
+            ]
+        },
+    )
+
+
+def handle_set_interval_reply(chat_id, text):
+    try:
+        val = int(text.strip())
+        if val <= 0:
+            raise ValueError
+    except ValueError:
+        tg_send("❌ فقط یه عدد صحیح مثبت بفرست (به دقیقه)، مثلاً 10", chat_id=chat_id)
+        runtime["pending_action"][chat_id] = "set_interval"
+        return
+    runtime["check_interval_minutes"] = val
+    save_state()
+    tg_send(f"✅ فاصله‌ی بررسی خودکار روی هر {val} دقیقه تنظیم شد.", chat_id=chat_id, reply_markup=main_menu_keyboard())
 
 
 def handle_check_user_prompt(chat_id):
@@ -634,6 +682,14 @@ def telegram_polling_loop():
                     handle_history(chat_id)
                 elif data == "set_limit":
                     handle_set_limit_prompt(chat_id)
+                elif data == "set_interval":
+                    handle_set_interval_prompt(chat_id)
+                elif data.startswith("interval_"):
+                    val = int(data.split("_")[1])
+                    runtime["pending_action"].pop(chat_id, None)
+                    runtime["check_interval_minutes"] = val
+                    save_state()
+                    tg_send(f"✅ فاصله‌ی بررسی خودکار روی هر {val} دقیقه تنظیم شد.", chat_id=chat_id, reply_markup=main_menu_keyboard())
                 elif data == "check_user":
                     handle_check_user_prompt(chat_id)
                 elif data == "panel_menu":
@@ -642,7 +698,7 @@ def telegram_polling_loop():
                     handle_panel_show(chat_id)
                 elif data == "set_panel_url":
                     runtime["pending_action"][chat_id] = "set_panel_url"
-                    tg_send("آدرس پنل رو بفرست (مثلاً: https://panel.example.com)", chat_id=chat_id)
+                    tg_send("آدرس پنل رو بفرست (مثلاً: https://panel.example.com یا با پورت: https://panel.example.com:2096)", chat_id=chat_id)
                 elif data == "set_panel_username":
                     runtime["pending_action"][chat_id] = "set_panel_username"
                     tg_send("یوزرنیم ادمین پنل رو بفرست:", chat_id=chat_id)
@@ -667,6 +723,8 @@ def telegram_polling_loop():
                     handle_panel_field_reply(chat_id, pending, text)
                 elif pending == "set_limit":
                     handle_set_limit_reply(chat_id, text)
+                elif pending == "set_interval":
+                    handle_set_interval_reply(chat_id, text)
                 elif pending == "check_user":
                     threading.Thread(target=handle_check_user_reply, args=(chat_id, text)).start()
                 elif text in ("/start", "/menu"):
@@ -679,7 +737,7 @@ def telegram_polling_loop():
 # ================== حلقه چک خودکار پس‌زمینه ==================
 def background_check_loop():
     while True:
-        time.sleep(CHECK_INTERVAL_SECONDS)
+        time.sleep(runtime["check_interval_minutes"] * 60)
         if panel_is_configured():
             log.info("اجرای بررسی خودکار دوره‌ای...")
             run_check()
@@ -691,7 +749,7 @@ def main():
     load_state()
     if panel_is_configured():
         tg_send(
-            f"🤖 ربات روشن شد و آماده‌ست.\nهر ۱۰ دقیقه خودکار چک می‌کنه (حد مجاز فعلی: {runtime['max_allowed_ips']} IP).",
+            f"🤖 ربات روشن شد و آماده‌ست.\nهر {runtime['check_interval_minutes']} دقیقه خودکار چک می‌کنه (حد مجاز فعلی: {runtime['max_allowed_ips']} IP).",
             reply_markup=main_menu_keyboard(),
         )
     else:

@@ -45,6 +45,7 @@ chmod +x install.sh
 ## حذف کامل
 
 ```bash
+cd ~/pasarguard-ip-monitor
 chmod +x uninstall.sh
 ./uninstall.sh
 ```

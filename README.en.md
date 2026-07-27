@@ -45,6 +45,7 @@ After receiving all three, the bot attempts to connect to the panel and reports 
 ## Full removal
 
 ```bash
+cd ~/pasarguard-ip-monitor
 chmod +x uninstall.sh
 ./uninstall.sh
 ```
