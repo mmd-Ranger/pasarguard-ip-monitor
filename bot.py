@@ -363,33 +363,58 @@ def handle_panel_show(chat_id):
     )
 
 
-def handle_panel_reply(chat_id, action, text):
+CHAIN_NEXT = {"setup_url": "setup_username", "setup_username": "setup_password"}
+FIELD_MAP = {
+    "setup_url": "base_url", "set_panel_url": "base_url",
+    "setup_username": "username", "set_panel_username": "username",
+    "setup_password": "password", "set_panel_password": "password",
+}
+NEXT_PROMPT = {
+    "setup_username": "یوزرنیم ادمین (سودو) پنل رو بفرست:",
+    "setup_password": "رمز ادمین پنل رو بفرست:",
+}
+
+
+def start_panel_setup_wizard(chat_id):
+    tg_send(
+        "🔌 جهت اتصال به پنل، آدرس پنل خودت رو بدون path (همون آدرس داشبورد) بفرست:\n"
+        "مثلاً: https://panel.example.com",
+        chat_id=chat_id,
+    )
+    runtime["pending_action"][chat_id] = "setup_url"
+
+
+def handle_panel_field_reply(chat_id, pending, text):
     text = text.strip()
     cfg = load_panel_config() or {"base_url": "", "username": "", "password": ""}
+    field = FIELD_MAP[pending]
 
-    if action == "set_panel_url":
+    if field == "base_url":
         if not text.startswith("http"):
             tg_send("❌ آدرس باید با http:// یا https:// شروع بشه. دوباره بفرست:", chat_id=chat_id)
-            runtime["pending_action"][chat_id] = "set_panel_url"
+            runtime["pending_action"][chat_id] = pending
             return
-        cfg["base_url"] = text.rstrip("/")
-        save_panel_config(cfg)
-        tg_send(f"✅ آدرس پنل ذخیره شد: {cfg['base_url']}", chat_id=chat_id, reply_markup=panel_menu_keyboard())
+        text = text.rstrip("/")
 
-    elif action == "set_panel_username":
-        cfg["username"] = text
-        save_panel_config(cfg)
-        tg_send(f"✅ یوزرنیم ادمین ذخیره شد: {cfg['username']}", chat_id=chat_id, reply_markup=panel_menu_keyboard())
+    cfg[field] = text
+    save_panel_config(cfg)
 
-    elif action == "set_panel_password":
-        cfg["password"] = text
-        save_panel_config(cfg)
-        tg_send("✅ پسورد ادمین ذخیره شد.", chat_id=chat_id, reply_markup=panel_menu_keyboard())
-        # پیام حاوی پسورد رو از چت پاک نمی‌کنیم چون تلگرام API این اجازه رو محدود می‌ده؛
-        # پیشنهاد می‌شه خودت پیام حاوی پسورد رو دستی پاک کنی.
+    next_step = CHAIN_NEXT.get(pending)
+    if next_step:
+        runtime["pending_action"][chat_id] = next_step
+        tg_send(f"✅ ذخیره شد.\n{NEXT_PROMPT[next_step]}", chat_id=chat_id)
+        return
 
     if cfg.get("base_url") and cfg.get("username") and cfg.get("password"):
-        tg_send("🎉 تنظیمات پنل کامل شد! حالا می‌تونی از «🧪 تست اتصال API» استفاده کنی.", chat_id=chat_id, reply_markup=main_menu_keyboard())
+        tg_send("🔄 در حال اتصال به پنل...", chat_id=chat_id)
+        try:
+            get_panel_token(force=True)
+            tg_send("✅ به پنل متصل شد!", chat_id=chat_id, reply_markup=main_menu_keyboard())
+        except Exception as e:
+            tg_send(f"❌ اتصال ناموفق: {e}\nاز «🛠 تنظیمات پنل» می‌تونی دوباره امتحان کنی.",
+                    chat_id=chat_id, reply_markup=main_menu_keyboard())
+    else:
+        tg_send("✅ ذخیره شد.", chat_id=chat_id, reply_markup=panel_menu_keyboard())
 
 
 # ================== منطق اصلی چک کردن (موازی) ==================
@@ -482,7 +507,7 @@ def handle_test_api(chat_id):
         template, data, results = try_get_user_ip_data(token, user_id, username)
         report = f"یوزر: {username}\n"
         if template:
-            report += f"✅ endpoint درست پیدا شد: {template}\nتعداد IP یکتا: {extract_ip_count(data)}\n"
+            report += f"✅ متصل شد - تعداد IP یکتا: {extract_ip_count(data)}\n"
         else:
             report += "❌ هیچ‌کدوم از endpoint ها جواب 200 ندادن:\n"
             for tmpl, status, body in results:
@@ -491,15 +516,12 @@ def handle_test_api(chat_id):
 
 
 def handle_status(chat_id):
-    last = runtime["last_check_time"]
-    ep = runtime["working_endpoint"] or "هنوز پیدا نشده"
     over = runtime["last_check_over_limit"]
     over_str = ", ".join(f"{u}({c})" for u, c in over) if over else "هیچکدوم"
     tg_send(
-        f"⏱ آخرین بررسی (وقت تهران): {fmt_tehran(last)}\n"
-        f"🔗 endpoint فعال: <code>{ep}</code>\n"
+        f"🟢 وضعیت اسکریپت: فعال\n"
+        f"🛠 وضعیت پنل: {'متصل ✅' if panel_is_configured() else 'تنظیم نشده ❌'}\n"
         f"📊 حد مجاز IP: {runtime['max_allowed_ips']}\n"
-        f"🛠 پنل تنظیم شده: {'بله ✅' if panel_is_configured() else 'خیر ❌'}\n"
         f"⚠️ یوزرهای بالای حد در آخرین بررسی: {over_str}",
         chat_id=chat_id,
     )
@@ -640,19 +662,16 @@ def telegram_polling_loop():
                     continue
 
                 pending = runtime["pending_action"].pop(chat_id, None)
-                if pending in ("set_panel_url", "set_panel_username", "set_panel_password"):
-                    handle_panel_reply(chat_id, pending, text)
+                if pending in ("setup_url", "setup_username", "setup_password",
+                               "set_panel_url", "set_panel_username", "set_panel_password"):
+                    handle_panel_field_reply(chat_id, pending, text)
                 elif pending == "set_limit":
                     handle_set_limit_reply(chat_id, text)
                 elif pending == "check_user":
                     threading.Thread(target=handle_check_user_reply, args=(chat_id, text)).start()
                 elif text in ("/start", "/menu"):
                     if not panel_is_configured():
-                        tg_send(
-                            "سلام! 👋 قبل از هر چیز باید پنل رو وصل کنیم.",
-                            chat_id=chat_id,
-                        )
-                        handle_panel_menu(chat_id)
+                        start_panel_setup_wizard(chat_id)
                     else:
                         tg_send("سلام! منوی مدیریت مانیتور IP:", chat_id=chat_id, reply_markup=main_menu_keyboard())
 
@@ -677,7 +696,7 @@ def main():
         )
     else:
         tg_send("🤖 ربات روشن شد، ولی پنل هنوز تنظیم نشده.")
-        handle_panel_menu(OWNER_CHAT_ID)
+        start_panel_setup_wizard(OWNER_CHAT_ID)
 
     threading.Thread(target=background_check_loop, daemon=True).start()
     telegram_polling_loop()

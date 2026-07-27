@@ -1,59 +1,34 @@
 #!/usr/bin/env bash
-# نصب و راه‌اندازی ربات مانیتور IP پنل PasarGuard
 set -e
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-echo "=================================================="
-echo "  نصب ربات مانیتور IP پنل PasarGuard"
-echo "=================================================="
-echo
+echo "== PasarGuard IP Monitor - Install =="
 
-if ! command -v python3 &> /dev/null; then
-    echo "❌ python3 پیدا نشد. اول پایتون ۳ رو نصب کن."
-    exit 1
-fi
+echo "Installing prerequisites..."
+sudo apt-get update -qq
+sudo apt-get install -y -qq python3 python3-venv python3-pip > /dev/null
 
-# ---------- گرفتن اطلاعات لازم ----------
-read -rp "توکن ربات تلگرام (از @BotFather): " BOT_TOKEN
-while [ -z "$BOT_TOKEN" ]; do
-    read -rp "توکن نمی‌تونه خالی باشه، دوباره وارد کن: " BOT_TOKEN
-done
+read -rp "Telegram bot token: " BOT_TOKEN
+while [ -z "$BOT_TOKEN" ]; do read -rp "Cannot be empty, try again: " BOT_TOKEN; done
 
-echo
-echo "آیدی عددی خودت رو لازم داریم (نه یوزرنیم!). اگه نمی‌دونی چیه،"
-echo "به ربات @userinfobot تو تلگرام پیام بده تا آیدی عددیت رو بهت بگه."
-read -rp "آیدی عددی تلگرام (Owner Chat ID): " OWNER_ID
-while ! [[ "$OWNER_ID" =~ ^-?[0-9]+$ ]]; do
-    read -rp "این یه عدد نبود، دوباره وارد کن: " OWNER_ID
-done
+read -rp "Your numeric Telegram chat ID (owner): " OWNER_ID
+while ! [[ "$OWNER_ID" =~ ^-?[0-9]+$ ]]; do read -rp "Must be a number: " OWNER_ID; done
 
-# ---------- ساخت .env ----------
-cat > .env << EOF
+cat > .env << ENVEOF
 TELEGRAM_BOT_TOKEN=$BOT_TOKEN
 OWNER_CHAT_ID=$OWNER_ID
-EOF
-echo "✅ فایل .env ساخته شد."
+ENVEOF
 
-# ---------- ساخت محیط مجازی و نصب پکیج‌ها ----------
-echo
-echo "در حال ساخت محیط مجازی پایتون و نصب پکیج‌ها..."
+echo "Setting up virtualenv..."
 python3 -m venv .venv
 ./.venv/bin/pip install --quiet --upgrade pip
 ./.venv/bin/pip install --quiet -r requirements.txt
-echo "✅ پکیج‌ها نصب شدن."
 
-# ---------- ساخت سرویس systemd (نیاز به sudo) ----------
-echo
-read -rp "می‌خوای به‌عنوان سرویس systemd نصب بشه که همیشه روشن بمونه و بعد از ریبوت هم بالا بیاد؟ (y/n): " USE_SYSTEMD
+SERVICE_NAME="pasarguard-ip-monitor"
+CURRENT_USER="$(whoami)"
 
-if [[ "$USE_SYSTEMD" =~ ^[Yy]$ ]]; then
-    SERVICE_NAME="pasarguard-ip-monitor"
-    CURRENT_USER="$(whoami)"
-    SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-
-    sudo tee "$SERVICE_FILE" > /dev/null << EOF
+sudo tee "/etc/systemd/system/${SERVICE_NAME}.service" > /dev/null << SVEOF
 [Unit]
 Description=PasarGuard IP Monitor Telegram Bot
 After=network.target
@@ -68,27 +43,15 @@ RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
-EOF
+SVEOF
 
-    sudo systemctl daemon-reload
-    sudo systemctl enable "$SERVICE_NAME"
-    sudo systemctl start "$SERVICE_NAME"
-
-    echo
-    echo "✅ سرویس نصب و استارت شد."
-    echo "   وضعیت:      sudo systemctl status $SERVICE_NAME"
-    echo "   لاگ زنده:   sudo journalctl -u $SERVICE_NAME -f"
-    echo "   ری‌استارت:  sudo systemctl restart $SERVICE_NAME"
-    echo "   توقف:       sudo systemctl stop $SERVICE_NAME"
-else
-    echo
-    echo "باشه، پس خودت دستی اجراش کن:"
-    echo "   ./.venv/bin/python -u bot.py"
-fi
+sudo systemctl daemon-reload
+sudo systemctl enable "$SERVICE_NAME" > /dev/null
+sudo systemctl start "$SERVICE_NAME"
 
 echo
-echo "=================================================="
-echo "  نصب تموم شد!"
-echo "  حالا برو تو تلگرام به ربات /start بزن."
-echo "  اول ازت آدرس پنل و اطلاعات ادمین رو می‌پرسه."
-echo "=================================================="
+echo "Done. Bot is running as a systemd service."
+echo "Status:  sudo systemctl status $SERVICE_NAME"
+echo "Logs:    sudo journalctl -u $SERVICE_NAME -f"
+echo
+echo "Now open Telegram and send /start to your bot."
