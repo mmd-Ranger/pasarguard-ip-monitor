@@ -24,7 +24,7 @@
 ## نصب
 
 ```bash
-git clone https://github.com/<your-username>/pasarguard-ip-monitor.git
+git clone https://github.com/mmd-Ranger/pasarguard-ip-monitor.git
 cd pasarguard-ip-monitor
 chmod +x install.sh
 ./install.sh
