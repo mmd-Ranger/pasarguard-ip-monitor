@@ -4,6 +4,10 @@ English | [فارسی](README.md) 🌐
 
 A Telegram bot that monitors the number of connected IPs per user on a PasarGuard panel and sends an automatic alert when a user exceeds the allowed limit (a possible sign of config sharing).
 
+## How does this bot work?
+
+Every N minutes (whatever interval you set, 15 minutes by default), the bot automatically checks the IPs of online panel users and sends you an alert if any of them exceed the allowed limit.
+
 ## Features
 
 - Automatic check every 10 minutes (configurable), only for online users, to keep it fast and reduce load on the panel
@@ -71,6 +75,18 @@ Yes. No secrets or tokens are in the code; everything is stored only on your own
 ## Contributing
 
 Issues and Pull Requests are welcome.
+
+## Author & Support
+
+**Developer:** Ranger-Dev
+**Telegram Channel:** [@YourChannel](https://t.me/YourChannel)
+
+If this project helped you and you'd like to support it:
+
+| Currency | Address |
+|---|---|
+| TRC20 (TRON) | `TV4Rnyg4YRzkPA8z9bfKWuG9pwSJZaJXqF` |
+| USDT BEP20 (BSC) | `0x4A7b557A853D532e83a1CA7101f69B6B399B12f5` |
 
 ## License
 

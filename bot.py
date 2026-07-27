@@ -414,7 +414,13 @@ def handle_panel_field_reply(chat_id, pending, text):
         tg_send("🔄 در حال اتصال به پنل...", chat_id=chat_id)
         try:
             get_panel_token(force=True)
-            tg_send("✅ به پنل متصل شد!", chat_id=chat_id, reply_markup=main_menu_keyboard())
+            tg_send(
+                "✅ به پنل متصل شد!\n\n"
+                "📌 این ربات چیکار می‌کنه؟\n"
+                "ربات هر چند دقیقه‌ای که شما تعیین کنید (پیش‌فرض ۱۵ دقیقه)، خودکار IP یوزرهای آنلاین پنل رو بررسی می‌کنه "
+                "و در صورت عبور از حد مجاز، بهتون هشدار می‌ده.",
+                chat_id=chat_id, reply_markup=main_menu_keyboard(),
+            )
         except requests.exceptions.HTTPError as e:
             if e.response is not None and e.response.status_code == 401:
                 tg_send(
