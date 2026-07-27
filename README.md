@@ -78,7 +78,7 @@ Issue و Pull Request خوش‌آمدید.
 
 ## سازنده و حمایت
 
-**Developer:** Ranger-Dev
+**Developer:** mmd-Ranger
 **کانال تلگرام:** [@YourChannel](https://t.me/YourChannel)
 
 اگه این پروژه بهت کمک کرد و خواستی حمایت کنی:
