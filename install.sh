@@ -6,8 +6,11 @@ cd "$SCRIPT_DIR"
 echo "== PasarGuard IP Monitor - Install =="
 
 echo "Installing prerequisites..."
-sudo apt-get update -qq
-sudo apt-get install -y -qq python3 python3-venv python3-pip > /dev/null
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_SUSPEND=1
+export NEEDRESTART_MODE=a
+sudo -E apt-get update -qq
+sudo -E apt-get install -y -qq python3 python3-venv python3-pip > /dev/null
 
 read -rp "Telegram bot token: " BOT_TOKEN
 while [ -z "$BOT_TOKEN" ]; do read -rp "Cannot be empty, try again: " BOT_TOKEN; done
