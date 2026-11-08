@@ -25,6 +25,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
+from requests.adapters import HTTPAdapter
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -49,13 +50,18 @@ except ValueError:
 DEFAULT_MAX_ALLOWED_IPS = 8
 DEFAULT_CHECK_INTERVAL_MINUTES = 15  # فاصله‌ی بررسی خودکار (دقیقه) - قابل تغییر از داخل ربات
 ALERT_COOLDOWN_SECONDS = 1800      # هر یوزر حداکثر هر ۳۰ دقیقه یک بار هشدار بگیره
-ONLINE_WINDOW_SECONDS = 120        # یوزر رو "آنلاین" حساب کن اگه online_at توی این بازه بوده
+ONLINE_WINDOW_SECONDS = 300        # یوزر رو "آنلاین" حساب کن اگه online_at توی این بازه بوده (online_at تو پنل کمی دیر آپدیت می‌شه، پس حاشیه‌ی امن)
 REQUEST_TIMEOUT = 15
-MAX_WORKERS = 12                   # تعداد درخواست همزمان به پنل
+MAX_WORKERS = 16                   # تعداد درخواست همزمان به پنل
 HISTORY_KEEP = 50
 CONFIRM_DELAY_SECONDS = 20         # قبل از هشدار، یوزرهای بالای حد دوباره چک می‌شن (کم‌ترین عدد دو بار ملاک است)
 MAX_FUTURE_SKEW = 300              # زمان IP که بیش از این (ثانیه) در آینده باشه، مشکوک حساب می‌شه و تازه نیست
 DEFAULT_IP_FRESH_WINDOW_MINUTES = 5  # فقط IPهایی که تو این بازه دیده شدن شمرده می‌شن - قابل تغییر از داخل ربات
+
+# اتصال مشترک (keep-alive): به‌جای handshake جدید برای هر درخواست، اتصال‌ها دوباره استفاده می‌شن
+HTTP = requests.Session()
+HTTP.mount("http://", HTTPAdapter(pool_connections=4, pool_maxsize=64))
+HTTP.mount("https://", HTTPAdapter(pool_connections=4, pool_maxsize=64))
 
 TEHRAN_TZ = ZoneInfo("Asia/Tehran")
 
@@ -187,7 +193,7 @@ def get_all_users(token: str) -> list:
     headers = {"Authorization": f"Bearer {token}"}
     users, offset, limit = [], 0, 100
     while True:
-        resp = requests.get(
+        resp = HTTP.get(
             f"{cfg['base_url']}/api/users",
             headers=headers, params={"offset": offset, "limit": limit},
             timeout=REQUEST_TIMEOUT,
@@ -353,7 +359,7 @@ def try_get_user_ip_data(token: str, user_id, username: str, probe=False):
         url = f"{cfg['base_url']}{template.format(id=user_id, username=username)}"
         for attempt in range(attempts):
             try:
-                resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+                resp = HTTP.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
             except Exception as e:
                 results.append((template, None, f"خطای شبکه: {e}"))
                 if attempt + 1 < attempts:
@@ -541,28 +547,39 @@ def _fetch_one(token, user, window):
 
 
 _ONLINE_AGES = {}
+_ONLINE_REF = [0.0]   # لحظه‌ای که لیست یوزرها گرفته شد (مبنای «آخرین آنلاین»)
+
+
+def _severity(fc, limit):
+    if fc >= limit * 2:
+        return "🔴"
+    if fc >= limit * 1.5:
+        return "🟠"
+    return "🟡"
 
 
 def send_alert_batches(to_alert, max_allowed, window):
-    """هشدارها رو دسته‌ای می‌فرسته تا با تعداد زیاد، فلود تلگرام (429) نخوریم"""
+    """هشدارها رو مرتب و دسته‌ای می‌فرسته (بیشترین IP اول)"""
     if not to_alert:
         return
     to_alert.sort(key=lambda x: -x[1])
     detail = len(to_alert) <= 5
-    now = time.time()
-    header = (f"⚠️ <b>هشدار تعداد IP بالا</b>\n"
-              f"حد مجاز: {max_allowed} | بازه اعتبار IP: {window // 60} دقیقه\n\n")
+    ref = _ONLINE_REF[0] or time.time()
+    header = (f"⚠️ <b>هشدار تعداد IP بالا</b> ({len(to_alert)} یوزر)\n"
+              f"حد مجاز: <b>{max_allowed}</b> | بازه اعتبار IP: {window // 60} دقیقه\n"
+              f"🔴 ≥۲× حد   🟠 ≥۱.۵× حد   🟡 بالاتر از حد\n"
+              f"━━━━━━━━━━━━━━\n")
     chunk = header
-    for username, fc, total, fresh in to_alert:
-        online_age = _ONLINE_AGES.get(username)
-        age_txt = f" | آخرین آنلاین: {fmt_age(online_age, now)}" if online_age else ""
+    for i, (username, fc, total, fresh) in enumerate(to_alert, 1):
+        online_ts = _ONLINE_AGES.get(username)
+        online_txt = f"  ⏱ {fmt_age(online_ts, ref)}" if online_ts else ""
         unk = sum(1 for e in fresh.values() if e["ts"] is None)
-        if unk:
-            age_txt += f" | ⚠️ {unk} IP بدون زمان"
-        block = f"• <code>{html.escape(username)}</code>: <b>{fc}</b> IP تازه (کل ثبت‌شده: {total}){age_txt}"
+        unk_txt = f"  ⚠️ {unk} IP بی‌زمان" if unk else ""
+        block = (f"{_severity(fc, max_allowed)} <b>{i}.</b> <code>{html.escape(username)}</code>\n"
+                 f"      <b>{fc}</b> IP  (کل: {total}){online_txt}{unk_txt}")
         if detail:
             for ip, e in sorted(fresh.items(), key=lambda kv: -(kv[1]["ts"] or 0)):
-                block += f"\n   {ip} — {fmt_age(e['ts'], now)}"
+                block += f"\n      · {ip} — {fmt_age(e['ts'], ref)}"
         if len(chunk) + len(block) + 2 > 3800:
             tg_send(chunk)
             chunk = ""
@@ -584,12 +601,14 @@ def run_check(notify_chat_id=None):
         return
 
     active_users = [u for u in users if is_recently_online(u)]
+    total_users, online_candidates = len(users), len(active_users)
     if not active_users:
         log.warning("هیچ یوزر آنلاینی بر اساس online_at پیدا نشد؛ برای اطمینان همه رو چک می‌کنیم")
         active_users = users
 
     window = runtime["ip_fresh_window_minutes"] * 60
     user_by_name = {u.get("username", str(u.get("id"))): u for u in users}
+    _ONLINE_REF[0] = time.time()
     _ONLINE_AGES.clear()
     for _name, _u in user_by_name.items():
         _ONLINE_AGES[_name] = parse_iso_to_epoch(_u.get("online_at"))
@@ -647,6 +666,8 @@ def run_check(notify_chat_id=None):
     runtime["check_history"].append({
         "time": now,
         "users_checked": len(results),
+        "users_total": total_users,
+        "online_candidates": online_candidates,
         "over_limit_count": len(over_limit),
         "manual": bool(notify_chat_id),
         "errors": errors,
@@ -656,11 +677,13 @@ def run_check(notify_chat_id=None):
     save_state()
 
     if notify_chat_id:
-        footer = f"\n\n⏱ مدت: {duration} ثانیه | خطا: {errors} | بازه اعتبار IP: {window // 60} دقیقه"
+        footer = (f"\n\n👥 کل یوزرها: {total_users} | آنلاین (online_at ≤ {ONLINE_WINDOW_SECONDS // 60} دقیقه): {online_candidates}"
+                  f"\n⏱ مدت: {duration} ثانیه | خطا: {errors} | بازه اعتبار IP: {window // 60} دقیقه")
         if over_limit:
             over_limit.sort(key=lambda x: -x[1])
             shown = over_limit[:40]
-            lines = "\n".join(f"• <code>{html.escape(u)}</code>: {fc} IP تازه (کل {total})" for u, fc, total in shown)
+            lines = "\n".join(f"{_severity(fc, max_allowed)} <b>{i}.</b> <code>{html.escape(u)}</code> — <b>{fc}</b> IP (کل {total})"
+                              for i, (u, fc, total) in enumerate(shown, 1))
             more = f"\n... و {len(over_limit) - len(shown)} مورد دیگه" if len(over_limit) > len(shown) else ""
             tg_send(f"بررسی تمام شد. {len(over_limit)} یوزر بالای حد مجاز ({max_allowed}):\n{lines}{more}{footer}",
                     chat_id=notify_chat_id)
@@ -721,7 +744,9 @@ def handle_history(chat_id):
         tag = "دستی 👤" if entry.get("manual") else "خودکار 🤖"
         lines.append(
             f"🕐 {fmt_tehran(entry['time'])} ({tag})\n"
-            f"   {entry['users_checked']} یوزر چک شد، {entry['over_limit_count']} تا بالای حد"
+            f"   {entry['users_checked']} یوزر چک شد"
+            + (f" (از {entry['users_total']} کل)" if "users_total" in entry else "")
+            + f"، {entry['over_limit_count']} تا بالای حد"
             + (f" | {entry['duration']} ثانیه، {entry.get('errors', 0)} خطا" if "duration" in entry else "")
         )
     tg_send("<b>۱۰ بررسی آخر (وقت تهران):</b>\n\n" + "\n\n".join(lines), chat_id=chat_id)
