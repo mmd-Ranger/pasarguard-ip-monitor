@@ -12,9 +12,11 @@
 
 import concurrent.futures
 import datetime
+import html
 import json
 import logging
 import os
+import random
 import sys
 import threading
 import time
@@ -50,6 +52,7 @@ ONLINE_WINDOW_SECONDS = 120        # یوزر رو "آنلاین" حساب کن 
 REQUEST_TIMEOUT = 15
 MAX_WORKERS = 12                   # تعداد درخواست همزمان به پنل
 HISTORY_KEEP = 50
+DEFAULT_IP_FRESH_WINDOW_MINUTES = 5  # فقط IPهایی که تو این بازه دیده شدن شمرده می‌شن - قابل تغییر از داخل ربات
 
 TEHRAN_TZ = ZoneInfo("Asia/Tehran")
 
@@ -73,6 +76,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("pg_bot")
 
 # ================== وضعیت مشترک ==================
+state_lock = threading.Lock()
 runtime = {
     "working_endpoint": None,
     "last_check_time": None,
@@ -82,6 +86,7 @@ runtime = {
     "panel_token_time": 0,
     "max_allowed_ips": DEFAULT_MAX_ALLOWED_IPS,
     "check_interval_minutes": DEFAULT_CHECK_INTERVAL_MINUTES,
+    "ip_fresh_window_minutes": DEFAULT_IP_FRESH_WINDOW_MINUTES,
     "check_history": [],
     "pending_action": {},   # chat_id -> "set_limit" | "check_user" | "set_panel_url" | "set_panel_username" | "set_panel_password"
 }
@@ -125,20 +130,26 @@ def load_state():
             runtime["working_endpoint"] = saved.get("working_endpoint")
             runtime["max_allowed_ips"] = saved.get("max_allowed_ips", DEFAULT_MAX_ALLOWED_IPS)
             runtime["check_interval_minutes"] = saved.get("check_interval_minutes", DEFAULT_CHECK_INTERVAL_MINUTES)
+            runtime["ip_fresh_window_minutes"] = saved.get("ip_fresh_window_minutes", DEFAULT_IP_FRESH_WINDOW_MINUTES)
             runtime["check_history"] = saved.get("check_history", [])
         except Exception:
             pass
 
 
 def save_state():
+    # نوشتن اتمیک (اول فایل موقت، بعد جایگزینی) تا با چند thread هم فایل خراب نشه
     try:
-        STATE_FILE.write_text(json.dumps({
-            "alert_state": runtime["alert_state"],
-            "working_endpoint": runtime["working_endpoint"],
-            "max_allowed_ips": runtime["max_allowed_ips"],
-            "check_interval_minutes": runtime["check_interval_minutes"],
-            "check_history": runtime["check_history"][-HISTORY_KEEP:],
-        }))
+        with state_lock:
+            tmp = STATE_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps({
+                "alert_state": runtime["alert_state"],
+                "working_endpoint": runtime["working_endpoint"],
+                "max_allowed_ips": runtime["max_allowed_ips"],
+                "check_interval_minutes": runtime["check_interval_minutes"],
+                "ip_fresh_window_minutes": runtime["ip_fresh_window_minutes"],
+                "check_history": runtime["check_history"][-HISTORY_KEEP:],
+            }))
+            tmp.replace(STATE_FILE)
     except Exception as e:
         log.warning(f"ذخیره state ناموفق: {e}")
 
@@ -207,88 +218,125 @@ def is_recently_online(user, window=ONLINE_WINDOW_SECONDS) -> bool:
     return (time.time() - epoch) <= window
 
 
-def extract_ip_count(data) -> int:
-    ips = set()
+def _to_epoch(value):
+    """مقدار زمانی هر IP رو به epoch (ثانیه) تبدیل می‌کنه؛ اگه عدد نبود None"""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if v > 1e11:  # میلی‌ثانیه
+        v /= 1000.0
+    return v
+
+
+def extract_ip_entries(data) -> dict:
+    """خروجی: {ip: {"ts": آخرین زمان دیده‌شدن یا None, "nodes": {node_id, ...}}}"""
+    entries = {}
+
+    def add(ip, ts, node):
+        if not ip:
+            return
+        e = entries.setdefault(ip, {"ts": None, "nodes": set()})
+        if ts is not None and (e["ts"] is None or ts > e["ts"]):
+            e["ts"] = ts
+        if node is not None:
+            e["nodes"].add(str(node))
+
+    # شکل تأییدشده: {"nodes": {"1": {"ips": {"1.2.3.4": <timestamp>}}, ...}}
     if isinstance(data, dict) and isinstance(data.get("nodes"), dict):
-        for node_info in data["nodes"].values():
+        for node_id, node_info in data["nodes"].items():
             if not isinstance(node_info, dict):
                 continue
             node_ips = node_info.get("ips")
             if isinstance(node_ips, dict):
-                ips.update(node_ips.keys())
+                for ip, ts in node_ips.items():
+                    add(ip, _to_epoch(ts), node_id)
             elif isinstance(node_ips, list):
                 for item in node_ips:
                     if isinstance(item, str):
-                        ips.add(item)
+                        add(item, None, node_id)
                     elif isinstance(item, dict):
-                        ip = item.get("ip") or item.get("address")
-                        if ip:
-                            ips.add(ip)
-        return len(ips)
+                        add(item.get("ip") or item.get("address"),
+                            _to_epoch(item.get("last_seen") or item.get("ts")), node_id)
+        return entries
 
+    # شکل‌های جایگزین (لیست ساده یا دیکشنری از لیست‌ها)
     if isinstance(data, list):
-        for item in data:
-            if isinstance(item, str):
-                ips.add(item)
-            elif isinstance(item, dict):
-                ip = item.get("ip") or item.get("address")
-                if ip:
-                    ips.add(ip)
+        items = data
     elif isinstance(data, dict):
-        for key, val in data.items():
-            if isinstance(val, list):
-                for item in val:
-                    if isinstance(item, str):
-                        ips.add(item)
-                    elif isinstance(item, dict):
-                        ip = item.get("ip") or item.get("address")
-                        if ip:
-                            ips.add(ip)
-    return len(ips)
+        items = [i for v in data.values() if isinstance(v, list) for i in v]
+    else:
+        items = []
+    for item in items:
+        if isinstance(item, str):
+            add(item, None, None)
+        elif isinstance(item, dict):
+            add(item.get("ip") or item.get("address"),
+                _to_epoch(item.get("last_seen") or item.get("ts")), None)
+    return entries
 
 
-def extract_ip_breakdown(data) -> str:
-    lines = []
-    if isinstance(data, dict) and isinstance(data.get("nodes"), dict):
-        for node_id, node_info in data["nodes"].items():
-            ips = node_info.get("ips", {}) if isinstance(node_info, dict) else {}
-            if ips:
-                lines.append(f"نود {node_id}: " + "، ".join(ips.keys()))
-    return "\n".join(lines)
+def split_fresh(entries: dict, window_seconds: float, now=None) -> dict:
+    """فقط IPهایی که تو بازه‌ی window_seconds دیده شدن (IP بدون زمان، تازه حساب می‌شه)"""
+    now = now or time.time()
+    return {ip: e for ip, e in entries.items()
+            if e["ts"] is None or (now - e["ts"]) <= window_seconds}
 
 
-def try_get_user_ip_data(token: str, user_id, username: str):
+def extract_ip_count(data) -> int:
+    return len(extract_ip_entries(data))
+
+
+def fmt_age(ts, now=None) -> str:
+    if ts is None:
+        return "زمان نامشخص"
+    sec = max(0, int((now or time.time()) - ts))
+    if sec < 60:
+        return f"{sec} ثانیه پیش"
+    if sec < 3600:
+        return f"{sec // 60} دقیقه پیش"
+    return f"{sec // 3600} ساعت پیش"
+
+
+def try_get_user_ip_data(token: str, user_id, username: str, probe=False):
+    """
+    حالت عادی: وقتی endpoint درست مشخصه، فقط همون رو (با یک بار تلاش مجدد) صدا می‌زنه.
+    حالت probe (تست API): همه‌ی endpointهای احتمالی رو امتحان می‌کنه.
+    """
     cfg = load_panel_config()
     headers = {"Authorization": f"Bearer {token}"}
-    candidates = CANDIDATE_IP_ENDPOINTS
-    if runtime["working_endpoint"]:
-        candidates = [runtime["working_endpoint"]] + [e for e in CANDIDATE_IP_ENDPOINTS if e != runtime["working_endpoint"]]
+    known = runtime["working_endpoint"]
+    if known and not probe:
+        candidates, attempts = [known], 2
+    else:
+        candidates = ([known] if known else []) + [e for e in CANDIDATE_IP_ENDPOINTS if e != known]
+        attempts = 1
 
     results = []
     for template in candidates:
-        path = template.format(id=user_id, username=username)
-        url = f"{cfg['base_url']}{path}"
-        try:
-            resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-        except Exception as e:
-            results.append((template, None, f"خطای شبکه: {e}"))
-            continue
-        results.append((template, resp.status_code, resp.text[:500]))
-        if resp.status_code == 200:
-            runtime["working_endpoint"] = template
-            save_state()
+        url = f"{cfg['base_url']}{template.format(id=user_id, username=username)}"
+        for attempt in range(attempts):
             try:
-                return template, resp.json(), results
-            except Exception:
-                return template, None, results
+                resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+            except Exception as e:
+                results.append((template, None, f"خطای شبکه: {e}"))
+                if attempt + 1 < attempts:
+                    time.sleep(1)
+                continue
+            results.append((template, resp.status_code, resp.text[:500]))
+            if resp.status_code == 200:
+                if runtime["working_endpoint"] != template:
+                    runtime["working_endpoint"] = template
+                    save_state()
+                try:
+                    return template, resp.json(), results
+                except Exception:
+                    return template, None, results
+            if resp.status_code in (429, 500, 502, 503, 504) and attempt + 1 < attempts:
+                time.sleep(1)
+                continue
+            break
     return None, None, results
-
-
-def get_user_ip_count(token: str, user_id, username: str) -> int:
-    _, data, _ = try_get_user_ip_data(token, user_id, username)
-    if data is None:
-        return 0
-    return extract_ip_count(data)
 
 
 # ================== تلگرام ==================
@@ -321,6 +369,8 @@ def main_menu_keyboard():
              {"text": "🔎 بررسی یوزر خاص", "callback_data": "check_user"}],
             [{"text": "⚙️ حد مجاز IP", "callback_data": "set_limit"},
              {"text": "⏱ فاصله بررسی", "callback_data": "set_interval"}],
+            [{"text": "⏳ بازه اعتبار IP", "callback_data": "set_fresh"},
+             {"text": "📈 تحلیل نمونه", "callback_data": "sample"}],
             [{"text": "🕐 تاریخچه", "callback_data": "history"},
              {"text": "🧪 تست اتصال API", "callback_data": "test_api"}],
             [{"text": "ℹ️ وضعیت", "callback_data": "status"},
@@ -439,16 +489,46 @@ def handle_panel_field_reply(chat_id, pending, text):
 
 
 # ================== منطق اصلی چک کردن (موازی) ==================
-def _fetch_one(token, user):
+def _fetch_one(token, user, window):
+    """خروجی: (username, همه‌ی IPها, IPهای تازه, خطا)"""
     user_id = user.get("id")
     username = user.get("username", str(user_id))
     try:
-        return username, get_user_ip_count(token, user_id, username), None
+        template, data, results = try_get_user_ip_data(token, user_id, username)
+        if data is None:
+            last = results[-1][1] if results else "?"
+            return username, None, None, f"پاسخ معتبر نیومد (status: {last})"
+        entries = extract_ip_entries(data)
+        return username, entries, split_fresh(entries, window), None
     except Exception as e:
-        return username, None, str(e)
+        return username, None, None, str(e)
+
+
+def send_alert_batches(to_alert, max_allowed, window):
+    """هشدارها رو دسته‌ای می‌فرسته تا با تعداد زیاد، فلود تلگرام (429) نخوریم"""
+    if not to_alert:
+        return
+    to_alert.sort(key=lambda x: -x[1])
+    detail = len(to_alert) <= 5
+    now = time.time()
+    header = (f"⚠️ <b>هشدار تعداد IP بالا</b>\n"
+              f"حد مجاز: {max_allowed} | بازه اعتبار IP: {window // 60} دقیقه\n\n")
+    chunk = header
+    for username, fc, total, fresh in to_alert:
+        block = f"• <code>{html.escape(username)}</code>: <b>{fc}</b> IP تازه (کل ثبت‌شده: {total})"
+        if detail:
+            for ip, e in sorted(fresh.items(), key=lambda kv: -(kv[1]["ts"] or 0)):
+                block += f"\n   {ip} — {fmt_age(e['ts'], now)}"
+        if len(chunk) + len(block) + 2 > 3800:
+            tg_send(chunk)
+            chunk = ""
+        chunk += block + "\n\n"
+    if chunk.strip():
+        tg_send(chunk)
 
 
 def run_check(notify_chat_id=None):
+    started = time.time()
     try:
         token = get_panel_token()
         users = get_all_users(token)
@@ -464,50 +544,59 @@ def run_check(notify_chat_id=None):
         log.warning("هیچ یوزر آنلاینی بر اساس online_at پیدا نشد؛ برای اطمینان همه رو چک می‌کنیم")
         active_users = users
 
-    results = {}
+    window = runtime["ip_fresh_window_minutes"] * 60
+    results = {}   # username -> (IPهای تازه, تعداد کل IP ثبت‌شده)
+    errors = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(_fetch_one, token, u) for u in active_users]
+        futures = [executor.submit(_fetch_one, token, u, window) for u in active_users]
         for fut in concurrent.futures.as_completed(futures):
-            username, count, err = fut.result()
+            username, entries, fresh, err = fut.result()
             if err:
+                errors += 1
                 log.warning(f"خطا در گرفتن IP برای {username}: {err}")
                 continue
-            results[username] = count
+            results[username] = (fresh, len(entries))
 
     max_allowed = runtime["max_allowed_ips"]
-    over_limit = []
-    for username, ip_count in results.items():
-        if ip_count > max_allowed:
-            over_limit.append((username, ip_count))
-            last = runtime["alert_state"].get(username, 0)
-            if time.time() - last >= ALERT_COOLDOWN_SECONDS:
-                tg_send(
-                    f"⚠️ <b>هشدار تعداد IP بالا</b>\nیوزر: <code>{username}</code>\n"
-                    f"تعداد کل IP: <b>{ip_count}</b> (حد مجاز: {max_allowed})"
-                )
-                runtime["alert_state"][username] = time.time()
+    now = time.time()
+    over_limit, to_alert = [], []
+    for username, (fresh, total) in results.items():
+        fc = len(fresh)
+        if fc > max_allowed:
+            over_limit.append((username, fc, total))
+            if now - runtime["alert_state"].get(username, 0) >= ALERT_COOLDOWN_SECONDS:
+                to_alert.append((username, fc, total, fresh))
+                runtime["alert_state"][username] = now
         else:
             runtime["alert_state"].pop(username, None)
+    send_alert_batches(to_alert, max_allowed, window)
 
-    now = time.time()
+    duration = int(time.time() - started)
     runtime["last_check_time"] = now
-    runtime["last_check_over_limit"] = over_limit
+    runtime["last_check_over_limit"] = [(u, fc) for u, fc, _ in over_limit]
     runtime["check_history"].append({
         "time": now,
         "users_checked": len(results),
         "over_limit_count": len(over_limit),
         "manual": bool(notify_chat_id),
+        "errors": errors,
+        "duration": duration,
     })
     runtime["check_history"] = runtime["check_history"][-HISTORY_KEEP:]
     save_state()
 
     if notify_chat_id:
+        footer = f"\n\n⏱ مدت: {duration} ثانیه | خطا: {errors} | بازه اعتبار IP: {window // 60} دقیقه"
         if over_limit:
             over_limit.sort(key=lambda x: -x[1])
-            lines = "\n".join(f"• <code>{u}</code>: {c} IP" for u, c in over_limit)
-            tg_send(f"بررسی تمام شد. {len(over_limit)} یوزر بالای حد مجاز ({max_allowed}):\n{lines}", chat_id=notify_chat_id)
+            shown = over_limit[:40]
+            lines = "\n".join(f"• <code>{html.escape(u)}</code>: {fc} IP تازه (کل {total})" for u, fc, total in shown)
+            more = f"\n... و {len(over_limit) - len(shown)} مورد دیگه" if len(over_limit) > len(shown) else ""
+            tg_send(f"بررسی تمام شد. {len(over_limit)} یوزر بالای حد مجاز ({max_allowed}):\n{lines}{more}{footer}",
+                    chat_id=notify_chat_id)
         else:
-            tg_send(f"بررسی تمام شد. {len(results)} یوزر آنلاین چک شد، همه زیر حد مجاز ({max_allowed}) بودن. ✅", chat_id=notify_chat_id)
+            tg_send(f"بررسی تمام شد. {len(results)} یوزر آنلاین چک شد، همه زیر حد مجاز ({max_allowed}) بودن. ✅{footer}",
+                    chat_id=notify_chat_id)
 
 
 def handle_test_api(chat_id):
@@ -525,10 +614,12 @@ def handle_test_api(chat_id):
     for user in users:
         user_id = user.get("id")
         username = user.get("username", str(user_id))
-        template, data, results = try_get_user_ip_data(token, user_id, username)
+        template, data, results = try_get_user_ip_data(token, user_id, username, probe=True)
         report = f"یوزر: {username}\n"
         if template:
-            report += f"✅ متصل شد - تعداد IP یکتا: {extract_ip_count(data)}\n"
+            entries = extract_ip_entries(data)
+            fresh = split_fresh(entries, runtime["ip_fresh_window_minutes"] * 60)
+            report += f"✅ متصل شد - IP تازه: {len(fresh)} | کل ثبت‌شده: {len(entries)}\n"
         else:
             report += "❌ هیچ‌کدوم از endpoint ها جواب 200 ندادن:\n"
             for tmpl, status, body in results:
@@ -544,6 +635,7 @@ def handle_status(chat_id):
         f"🛠 وضعیت پنل: {'متصل ✅' if panel_is_configured() else 'تنظیم نشده ❌'}\n"
         f"📊 حد مجاز IP: {runtime['max_allowed_ips']}\n"
         f"⏱ فاصله بررسی خودکار: هر {runtime['check_interval_minutes']} دقیقه\n"
+        f"⏳ بازه اعتبار IP: {runtime['ip_fresh_window_minutes']} دقیقه\n"
         f"⚠️ یوزرهای بالای حد در آخرین بررسی: {over_str}",
         chat_id=chat_id,
     )
@@ -560,6 +652,7 @@ def handle_history(chat_id):
         lines.append(
             f"🕐 {fmt_tehran(entry['time'])} ({tag})\n"
             f"   {entry['users_checked']} یوزر چک شد، {entry['over_limit_count']} تا بالای حد"
+            + (f" | {entry['duration']} ثانیه، {entry.get('errors', 0)} خطا" if "duration" in entry else "")
         )
     tg_send("<b>۱۰ بررسی آخر (وقت تهران):</b>\n\n" + "\n\n".join(lines), chat_id=chat_id)
 
@@ -645,12 +738,116 @@ def handle_check_user_reply(chat_id, username_query):
         tg_send("❌ نتونستم لیست IP این یوزر رو بگیرم.", chat_id=chat_id, reply_markup=main_menu_keyboard())
         return
 
-    count = extract_ip_count(data)
-    breakdown = extract_ip_breakdown(data)
-    msg = f"یوزر: <code>{username}</code>\nتعداد IP یکتا: <b>{count}</b> (حد مجاز فعلی: {runtime['max_allowed_ips']})"
-    if breakdown:
-        msg += f"\n\n{breakdown}"
+    entries = extract_ip_entries(data)
+    window = runtime["ip_fresh_window_minutes"] * 60
+    fresh = split_fresh(entries, window)
+    now = time.time()
+    msg = (f"یوزر: <code>{html.escape(username)}</code>\n"
+           f"IP تازه ({runtime['ip_fresh_window_minutes']} دقیقه اخیر): <b>{len(fresh)}</b> | "
+           f"کل ثبت‌شده: {len(entries)} | حد مجاز: {runtime['max_allowed_ips']}\n")
+    if entries:
+        msg += "\n"
+        ordered = sorted(entries.items(), key=lambda kv: -(kv[1]["ts"] or 0))
+        for ip, e in ordered[:40]:
+            mark = "🟢" if ip in fresh else "⚪️"
+            nodes = "، ".join(sorted(e["nodes"])) if e["nodes"] else "—"
+            msg += f"{mark} {ip} — {fmt_age(e['ts'], now)} (نود {nodes})\n"
+        if len(ordered) > 40:
+            msg += f"... و {len(ordered) - 40} مورد دیگه\n"
+        msg += "\n🟢 تازه (شمرده می‌شه)   ⚪️ قدیمی (شمرده نمی‌شه)"
     tg_send(msg, chat_id=chat_id, reply_markup=main_menu_keyboard())
+
+
+def handle_set_fresh_prompt(chat_id):
+    runtime["pending_action"][chat_id] = "set_fresh"
+    tg_send(
+        "فقط IPهایی شمرده می‌شن که تو این بازه آخرین بار دیده شده باشن؛ IPهای قدیمی‌تر نادیده گرفته می‌شن.\n"
+        f"الان: {runtime['ip_fresh_window_minutes']} دقیقه\n"
+        "یکی از گزینه‌ها رو انتخاب کن یا عدد دلخواه (به دقیقه) بفرست:",
+        chat_id=chat_id,
+        reply_markup={
+            "inline_keyboard": [
+                [{"text": "2", "callback_data": "fresh_2"},
+                 {"text": "5 (پیشنهادی)", "callback_data": "fresh_5"}],
+                [{"text": "10", "callback_data": "fresh_10"},
+                 {"text": "30", "callback_data": "fresh_30"}],
+            ]
+        },
+    )
+
+
+def _apply_fresh(chat_id, val):
+    runtime["ip_fresh_window_minutes"] = val
+    save_state()
+    tg_send(f"✅ بازه اعتبار IP روی {val} دقیقه تنظیم شد.", chat_id=chat_id, reply_markup=main_menu_keyboard())
+
+
+def handle_set_fresh_reply(chat_id, text):
+    try:
+        val = int(text.strip())
+        if val <= 0:
+            raise ValueError
+    except ValueError:
+        tg_send("❌ فقط یه عدد صحیح مثبت بفرست (به دقیقه)، مثلاً 5", chat_id=chat_id)
+        runtime["pending_action"][chat_id] = "set_fresh"
+        return
+    _apply_fresh(chat_id, val)
+
+
+def _percentile(sorted_vals, p):
+    if not sorted_vals:
+        return None
+    return sorted_vals[min(len(sorted_vals) - 1, int(len(sorted_vals) * p))]
+
+
+def handle_sample_analysis(chat_id):
+    """نمونه‌ی تصادفی از یوزرهای آنلاین رو تحلیل می‌کنه تا معلوم بشه IPهای قدیمی چقدر شمارش رو بالا می‌برن"""
+    tg_send("📈 در حال تحلیل یه نمونه‌ی تصادفی (حداکثر ۱۵۰ یوزر آنلاین)...", chat_id=chat_id)
+    try:
+        token = get_panel_token()
+        users = get_all_users(token)
+    except PanelNotConfigured:
+        tg_send("⚠️ پنل هنوز تنظیم نشده. از «🛠 تنظیمات پنل» استفاده کن.", chat_id=chat_id)
+        return
+    except Exception as e:
+        tg_send(f"❌ خطا در اتصال به پنل: {e}", chat_id=chat_id)
+        return
+
+    online = [u for u in users if is_recently_online(u)] or users
+    sample = random.sample(online, min(150, len(online)))
+    window = runtime["ip_fresh_window_minutes"] * 60
+    limit = runtime["max_allowed_ips"]
+    n = errors = over_all = over_fresh = total_ips = fresh_ips = 0
+    ages = []
+    now = time.time()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        for fut in concurrent.futures.as_completed([executor.submit(_fetch_one, token, u, window) for u in sample]):
+            _, entries, fresh, err = fut.result()
+            if err:
+                errors += 1
+                continue
+            n += 1
+            total_ips += len(entries)
+            fresh_ips += len(fresh)
+            over_all += len(entries) > limit
+            over_fresh += len(fresh) > limit
+            ages.extend((now - e["ts"]) / 60 for e in entries.values() if e["ts"] is not None)
+
+    if n == 0:
+        tg_send(f"❌ هیچ نمونه‌ی معتبری گرفته نشد (خطا: {errors}).", chat_id=chat_id, reply_markup=main_menu_keyboard())
+        return
+    ages.sort()
+    med, p90 = _percentile(ages, 0.5), _percentile(ages, 0.9)
+    age_line = f"\nسن IPها: میانه {med:.1f} دقیقه | ۹۰٪ زیر {p90:.1f} دقیقه" if ages else ""
+    tg_send(
+        f"📈 <b>تحلیل نمونه</b> ({n} یوزر، خطا: {errors})\n"
+        f"حد مجاز: {limit} | بازه اعتبار: {window // 60} دقیقه\n\n"
+        f"بالای حد با «همه IPها»: <b>{over_all}</b>\n"
+        f"بالای حد با «فقط IPهای تازه»: <b>{over_fresh}</b>\n"
+        f"میانگین IP برای هر یوزر: کل {total_ips / n:.1f} | تازه {fresh_ips / n:.1f}"
+        f"{age_line}",
+        chat_id=chat_id, reply_markup=main_menu_keyboard(),
+    )
 
 
 # ================== حلقه polling تلگرام ==================
@@ -698,6 +895,13 @@ def telegram_polling_loop():
                     tg_send(f"✅ فاصله‌ی بررسی خودکار روی هر {val} دقیقه تنظیم شد.", chat_id=chat_id, reply_markup=main_menu_keyboard())
                 elif data == "check_user":
                     handle_check_user_prompt(chat_id)
+                elif data == "set_fresh":
+                    handle_set_fresh_prompt(chat_id)
+                elif data.startswith("fresh_"):
+                    runtime["pending_action"].pop(chat_id, None)
+                    _apply_fresh(chat_id, int(data.split("_")[1]))
+                elif data == "sample":
+                    threading.Thread(target=handle_sample_analysis, args=(chat_id,)).start()
                 elif data == "panel_menu":
                     handle_panel_menu(chat_id)
                 elif data == "panel_show":
@@ -731,6 +935,8 @@ def telegram_polling_loop():
                     handle_set_limit_reply(chat_id, text)
                 elif pending == "set_interval":
                     handle_set_interval_reply(chat_id, text)
+                elif pending == "set_fresh":
+                    handle_set_fresh_reply(chat_id, text)
                 elif pending == "check_user":
                     threading.Thread(target=handle_check_user_reply, args=(chat_id, text)).start()
                 elif text in ("/start", "/menu"):

@@ -14,6 +14,9 @@ Every N minutes (whatever interval you set, 15 minutes by default), the bot auto
 - Parallel checking (multiple concurrent requests) for speed
 - Telegram alert when a user's unique IP count exceeds the limit (with a cooldown to prevent spam)
 - Configurable IP limit from within the bot itself
+- Counts only fresh IPs (configurable IP validity window, default 5 minutes) to avoid false alerts caused by stale IPs or mobile IP changes
+- Batched alerts showing each IP's last-seen time, suited to large panels (thousands of online users)
+- "📈 Sample analysis" to compare alert counts using all IPs vs. fresh IPs only
 - Manual check of a specific user, showing exact IPs broken down by node
 - Check history (Tehran time) to confirm the automatic check is actually running
 - Panel URL and admin credentials configured entirely from within the bot, no file editing required
