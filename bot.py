@@ -13,6 +13,7 @@
 import concurrent.futures
 import datetime
 import html
+import ipaddress
 import json
 import logging
 import os
@@ -52,6 +53,8 @@ ONLINE_WINDOW_SECONDS = 120        # یوزر رو "آنلاین" حساب کن 
 REQUEST_TIMEOUT = 15
 MAX_WORKERS = 12                   # تعداد درخواست همزمان به پنل
 HISTORY_KEEP = 50
+CONFIRM_DELAY_SECONDS = 20         # قبل از هشدار، یوزرهای بالای حد دوباره چک می‌شن (کم‌ترین عدد دو بار ملاک است)
+MAX_FUTURE_SKEW = 300              # زمان IP که بیش از این (ثانیه) در آینده باشه، مشکوک حساب می‌شه و تازه نیست
 DEFAULT_IP_FRESH_WINDOW_MINUTES = 5  # فقط IPهایی که تو این بازه دیده شدن شمرده می‌شن - قابل تغییر از داخل ربات
 
 TEHRAN_TZ = ZoneInfo("Asia/Tehran")
@@ -218,13 +221,39 @@ def is_recently_online(user, window=ONLINE_WINDOW_SECONDS) -> bool:
     return (time.time() - epoch) <= window
 
 
+def normalize_ip(ip):
+    """IPv6 رو به /64 تبدیل می‌کنه (آدرس‌های موقت/privacy یه دستگاه رو یکی می‌شمره)؛ IPv4-mapped رو به IPv4"""
+    try:
+        addr = ipaddress.ip_address(str(ip).strip())
+    except ValueError:
+        return str(ip).strip()
+    if addr.version == 6:
+        if addr.ipv4_mapped:
+            return str(addr.ipv4_mapped)
+        return str(ipaddress.ip_network(f"{addr}/64", strict=False).network_address) + "/64"
+    return str(addr)
+
+
 def _to_epoch(value):
-    """مقدار زمانی هر IP رو به epoch (ثانیه) تبدیل می‌کنه؛ اگه عدد نبود None"""
+    """مقدار زمانی هر IP رو به epoch (ثانیه) تبدیل می‌کنه. عدد، رشته‌ی عددی و رشته‌ی ISO رو می‌فهمه؛ وگرنه None"""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, str):
+        v = value.strip()
+        try:
+            f = float(v)
+        except ValueError:
+            return parse_iso_to_epoch(v)
+        value = f
     try:
         v = float(value)
     except (TypeError, ValueError):
         return None
-    if v > 1e11:  # میلی‌ثانیه
+    if v > 1e17:    # نانوثانیه
+        v /= 1e9
+    elif v > 1e14:  # میکروثانیه
+        v /= 1e6
+    elif v > 1e11:  # میلی‌ثانیه
         v /= 1000.0
     return v
 
@@ -236,6 +265,7 @@ def extract_ip_entries(data) -> dict:
     def add(ip, ts, node):
         if not ip:
             return
+        ip = normalize_ip(ip)
         e = entries.setdefault(ip, {"ts": None, "nodes": set()})
         if ts is not None and (e["ts"] is None or ts > e["ts"]):
             e["ts"] = ts
@@ -279,8 +309,14 @@ def extract_ip_entries(data) -> dict:
 def split_fresh(entries: dict, window_seconds: float, now=None) -> dict:
     """فقط IPهایی که تو بازه‌ی window_seconds دیده شدن (IP بدون زمان، تازه حساب می‌شه)"""
     now = now or time.time()
-    return {ip: e for ip, e in entries.items()
-            if e["ts"] is None or (now - e["ts"]) <= window_seconds}
+    out = {}
+    for ip, e in entries.items():
+        ts = e["ts"]
+        if ts is None:
+            out[ip] = e
+        elif -MAX_FUTURE_SKEW <= (now - ts) <= window_seconds:
+            out[ip] = e
+    return out
 
 
 def extract_ip_count(data) -> int:
@@ -504,6 +540,9 @@ def _fetch_one(token, user, window):
         return username, None, None, str(e)
 
 
+_ONLINE_AGES = {}
+
+
 def send_alert_batches(to_alert, max_allowed, window):
     """هشدارها رو دسته‌ای می‌فرسته تا با تعداد زیاد، فلود تلگرام (429) نخوریم"""
     if not to_alert:
@@ -515,7 +554,12 @@ def send_alert_batches(to_alert, max_allowed, window):
               f"حد مجاز: {max_allowed} | بازه اعتبار IP: {window // 60} دقیقه\n\n")
     chunk = header
     for username, fc, total, fresh in to_alert:
-        block = f"• <code>{html.escape(username)}</code>: <b>{fc}</b> IP تازه (کل ثبت‌شده: {total})"
+        online_age = _ONLINE_AGES.get(username)
+        age_txt = f" | آخرین آنلاین: {fmt_age(online_age, now)}" if online_age else ""
+        unk = sum(1 for e in fresh.values() if e["ts"] is None)
+        if unk:
+            age_txt += f" | ⚠️ {unk} IP بدون زمان"
+        block = f"• <code>{html.escape(username)}</code>: <b>{fc}</b> IP تازه (کل ثبت‌شده: {total}){age_txt}"
         if detail:
             for ip, e in sorted(fresh.items(), key=lambda kv: -(kv[1]["ts"] or 0)):
                 block += f"\n   {ip} — {fmt_age(e['ts'], now)}"
@@ -545,6 +589,10 @@ def run_check(notify_chat_id=None):
         active_users = users
 
     window = runtime["ip_fresh_window_minutes"] * 60
+    user_by_name = {u.get("username", str(u.get("id"))): u for u in users}
+    _ONLINE_AGES.clear()
+    for _name, _u in user_by_name.items():
+        _ONLINE_AGES[_name] = parse_iso_to_epoch(_u.get("online_at"))
     results = {}   # username -> (IPهای تازه, تعداد کل IP ثبت‌شده)
     errors = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -558,6 +606,28 @@ def run_check(notify_chat_id=None):
             results[username] = (fresh, len(entries))
 
     max_allowed = runtime["max_allowed_ips"]
+
+    # --- تأیید دوباره: فقط یوزرهای بالای حد، بعد از چند ثانیه دوباره گرفته می‌شن ---
+    suspects = [u for u, (fr, _) in results.items() if len(fr) > max_allowed]
+    if suspects:
+        time.sleep(CONFIRM_DELAY_SECONDS)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futs = {executor.submit(_fetch_one, token, user_by_name[u], window): u for u in suspects if u in user_by_name}
+            for fut in concurrent.futures.as_completed(futs):
+                uname = futs[fut]
+                _, entries2, fresh2, err2 = fut.result()
+                if err2 or fresh2 is None:
+                    continue
+                fresh1, total1 = results[uname]
+                # IPهایی که در هر دو بار تازه بودن (اشتراک) + اگه تعدادشون از حد کمتره، ردش کن
+                common = {ip: e for ip, e in fresh1.items() if ip in fresh2}
+                # اگه هیچ IP مشترکی نیست یعنی داده‌ی لحظه‌ای پایدار نیست؛ کمینه‌ی دو شمارش رو ملاک بگیر
+                if len(common) < min(len(fresh1), len(fresh2)):
+                    keep = fresh1 if len(fresh1) <= len(fresh2) else fresh2
+                else:
+                    keep = common
+                results[uname] = (keep if len(keep) <= len(fresh1) else fresh1, total1)
+
     now = time.time()
     over_limit, to_alert = [], []
     for username, (fresh, total) in results.items():
@@ -758,6 +828,30 @@ def handle_check_user_reply(chat_id, username_query):
     tg_send(msg, chat_id=chat_id, reply_markup=main_menu_keyboard())
 
 
+def handle_raw(chat_id, username_query):
+    """خروجی خام API پنل برای یه یوزر - برای دیباگ شمارش اشتباه"""
+    try:
+        token = get_panel_token()
+        users = get_all_users(token)
+    except Exception as e:
+        tg_send(f"❌ خطا: {e}", chat_id=chat_id)
+        return
+    match = next((u for u in users if u.get("username", "").lower() == username_query.strip().lower()), None)
+    if not match:
+        tg_send("یوزر پیدا نشد.", chat_id=chat_id)
+        return
+    template, data, results = try_get_user_ip_data(token, match.get("id"), match.get("username"))
+    if data is None:
+        tg_send(f"❌ پاسخ معتبر نیومد: {results[-1] if results else '?'}", chat_id=chat_id)
+        return
+    raw = json.dumps(data, ensure_ascii=False)
+    entries = extract_ip_entries(data)
+    fresh = split_fresh(entries, runtime["ip_fresh_window_minutes"] * 60)
+    head = (f"endpoint: {template}\nonline_at: {match.get('online_at')} | status: {match.get('status')}\n"
+            f"بعد از نرمال‌سازی: {len(entries)} IP (تازه: {len(fresh)}، بدون زمان: {sum(1 for e in entries.values() if e['ts'] is None)})\nخام ({len(raw)} کاراکتر):\n")
+    tg_send(f"<pre>{html.escape(head + raw[:3000])}</pre>", chat_id=chat_id)
+
+
 def handle_set_fresh_prompt(chat_id):
     runtime["pending_action"][chat_id] = "set_fresh"
     tg_send(
@@ -939,6 +1033,8 @@ def telegram_polling_loop():
                     handle_set_fresh_reply(chat_id, text)
                 elif pending == "check_user":
                     threading.Thread(target=handle_check_user_reply, args=(chat_id, text)).start()
+                elif text.startswith("/raw "):
+                    threading.Thread(target=handle_raw, args=(chat_id, text[5:])).start()
                 elif text in ("/start", "/menu"):
                     if not panel_is_configured():
                         start_panel_setup_wizard(chat_id)
