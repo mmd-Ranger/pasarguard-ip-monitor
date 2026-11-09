@@ -12,6 +12,7 @@
 
 import concurrent.futures
 import datetime
+import hashlib
 import html
 import ipaddress
 import json
@@ -26,6 +27,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
+from urllib.parse import quote
 from requests.adapters import HTTPAdapter
 from dotenv import load_dotenv
 
@@ -98,6 +100,9 @@ runtime = {
     "check_interval_minutes": DEFAULT_CHECK_INTERVAL_MINUTES,
     "ip_fresh_window_minutes": DEFAULT_IP_FRESH_WINDOW_MINUTES,
     "check_history": [],
+    "auto_disable": {"mode": "off", "strikes_needed": 3, "reenable_hours": 0, "exempt": []},
+    "strikes": {},          # username -> تعداد بررسی‌های پشت‌سرهم بالای حد
+    "disabled_users": {},   # username -> اطلاعات یوزرهایی که ربات غیرفعال کرده
     "ip_whitelist": [],     # قانون‌های لیست سفید IP (پیشوند، IP کامل یا CIDR)
     "pending_action": {},   # chat_id -> "set_limit" | "check_user" | "set_panel_url" | "set_panel_username" | "set_panel_password"
 }
@@ -144,6 +149,9 @@ def load_state():
             runtime["ip_fresh_window_minutes"] = saved.get("ip_fresh_window_minutes", DEFAULT_IP_FRESH_WINDOW_MINUTES)
             runtime["check_history"] = saved.get("check_history", [])
             runtime["ip_whitelist"] = saved.get("ip_whitelist", [])
+            runtime["auto_disable"].update(saved.get("auto_disable", {}))
+            runtime["strikes"] = saved.get("strikes", {})
+            runtime["disabled_users"] = saved.get("disabled_users", {})
         except Exception:
             pass
 
@@ -161,6 +169,9 @@ def save_state():
                 "ip_fresh_window_minutes": runtime["ip_fresh_window_minutes"],
                 "check_history": runtime["check_history"][-HISTORY_KEEP:],
                 "ip_whitelist": runtime["ip_whitelist"],
+                "auto_disable": runtime["auto_disable"],
+                "strikes": runtime["strikes"],
+                "disabled_users": runtime["disabled_users"],
             }))
             tmp.replace(STATE_FILE)
     except Exception as e:
@@ -546,7 +557,8 @@ def main_menu_keyboard():
              {"text": "🧪 تست اتصال API", "callback_data": "test_api"}],
             [{"text": "ℹ️ وضعیت", "callback_data": "status"},
              {"text": "🛠 تنظیمات پنل", "callback_data": "panel_menu"}],
-            [{"text": "🛡 لیست سفید IP", "callback_data": "whitelist"}],
+            [{"text": "🛡 لیست سفید IP", "callback_data": "whitelist"},
+             {"text": "🔒 غیرفعال‌سازی خودکار", "callback_data": "autodis"}],
         ]
     }
 
@@ -765,6 +777,10 @@ def send_alert_batches(to_alert, max_allowed, window):
     for i, (username, fc, total, fresh) in enumerate(to_alert, 1):
         online_ts = _ONLINE_AGES.get(username)
         online_txt = f"  ⏱ {fmt_age(online_ts, ref)}" if online_ts else ""
+        st = runtime["strikes"].get(username)
+        strike_txt = (f"  🔁 {st}/{runtime['auto_disable']['strikes_needed']}"
+                      if st and runtime["auto_disable"]["mode"] != "off" else "")
+        online_txt += strike_txt
         unk = sum(1 for e in fresh.values() if e["ts"] is None)
         unk_txt = f"  ⚠️ {unk} IP بی‌زمان" if unk else ""
         block = (f"{_severity(fc, max_allowed)} <b>{i}.</b> <code>{html.escape(username)}</code>\n"
@@ -793,6 +809,10 @@ def run_check(notify_chat_id=None):
         return
     try:
         _run_check_impl(notify_chat_id)
+        try:
+            process_auto_reenable()
+        except Exception:
+            log.exception("خطا در فعال‌سازی مجدد خودکار")
     finally:
         check_lock.release()
 
@@ -857,6 +877,9 @@ def _run_check_impl(notify_chat_id=None):
                 # ملاک، کمینه‌ی دو شمارش (محتاطانه): اگه تو بار دوم کمتر شد، همون کمتر ملاکه
                 results[uname] = (fresh1 if len(fresh1) <= len(fresh2) else fresh2, total1)
 
+    expected = len(active_users)
+    run_ok = errors <= max(3, expected * 0.05) and len(results) >= expected * 0.9
+
     now = time.time()
     over_limit, to_alert = [], []
     for username, (fresh, total) in results.items():
@@ -868,7 +891,9 @@ def _run_check_impl(notify_chat_id=None):
                 runtime["alert_state"][username] = now
         else:
             runtime["alert_state"].pop(username, None)
+    update_strikes(over_limit, run_ok)
     send_alert_batches(to_alert, max_allowed, window)
+    process_auto_disable(over_limit, user_by_name, run_ok, max_allowed)
 
     duration = int(time.time() - started)
     runtime["last_check_time"] = now
@@ -942,6 +967,7 @@ def handle_status(chat_id):
         f"📊 حد مجاز IP: {runtime['max_allowed_ips']}\n"
         f"⏱ فاصله بررسی خودکار: هر {runtime['check_interval_minutes']} دقیقه\n"
         f"⏳ بازه اعتبار IP: {runtime['ip_fresh_window_minutes']} دقیقه\n"
+        f"🔒 غیرفعال‌سازی خودکار: {AD_MODES[runtime['auto_disable']['mode']]} | غیرفعال‌شده‌ها: {len(runtime['disabled_users'])}\n"
         f"⚠️ یوزرهای بالای حد در آخرین بررسی: {over_str}",
         chat_id=chat_id,
     )
@@ -1183,6 +1209,342 @@ def handle_sample_analysis(chat_id):
 
 
 # ================== حلقه polling تلگرام ==================
+# ================== غیرفعال‌سازی خودکار ==================
+MAX_AUTO_DISABLE_PER_RUN = 15      # سقف ایمنی: اگه بیش از این تعداد یوزر همزمان واجد شرایط بودن، هیچ‌کدوم غیرفعال نمی‌شه
+AD_MODES = {"off": "⚪ خاموش", "dry": "🧪 آزمایشی", "on": "🟢 فعال"}
+AD_STRIKE_CHOICES = [1, 2, 3, 4, 5, 6]
+AD_REENABLE_CHOICES = [0, 6, 12, 24, 72]
+AD_LIST_MAX_SHOWN = 30
+
+
+def _name_hash(name: str) -> str:
+    return hashlib.sha1(name.lower().encode()).hexdigest()[:10]
+
+
+def _panel_user_call(method, username, json_body=None):
+    cfg = load_panel_config()
+    if not cfg:
+        raise PanelNotConfigured("پنل هنوز تنظیم نشده")
+    token = get_panel_token()
+    url = f"{cfg['base_url']}/api/user/{quote(username, safe='')}"
+    resp = None
+    for attempt in range(2):
+        headers = {"Authorization": f"Bearer {token}"}
+        resp = HTTP.request(method, url, headers=headers, json=json_body, timeout=REQUEST_TIMEOUT)
+        if resp.status_code == 401 and attempt == 0:
+            token = refresh_token_if_stale(token)
+            continue
+        break
+    return resp
+
+
+def panel_get_user_status(username):
+    """(status, error). اگه یوزر تو پنل نبود status='__missing__'"""
+    try:
+        resp = _panel_user_call("GET", username)
+    except Exception as e:
+        return None, str(e)
+    if resp.status_code == 404:
+        return "__missing__", None
+    if resp.status_code != 200:
+        return None, f"HTTP {resp.status_code}"
+    try:
+        return resp.json().get("status"), None
+    except Exception:
+        return None, "پاسخ نامعتبر از پنل"
+
+
+def panel_set_user_status(username, status):
+    """وضعیت یوزر رو تغییر می‌ده و بعدش از پنل دوباره می‌خونه تا مطمئن بشه. (ok, error)"""
+    try:
+        resp = _panel_user_call("PUT", username, {"status": status})
+        if resp.status_code == 405:
+            resp = _panel_user_call("PATCH", username, {"status": status})
+        if not (200 <= resp.status_code < 300):
+            hint = " (دسترسی ادمین ربات کافی نیست)" if resp.status_code == 403 else ""
+            return False, f"HTTP {resp.status_code}{hint}: {resp.text[:120]}"
+    except Exception as e:
+        return False, str(e)
+    new_status, err = panel_get_user_status(username)
+    if err is None and new_status != status:
+        return False, f"بعد از تغییر، وضعیت تو پنل «{new_status}» هست"
+    return True, None
+
+
+def update_strikes(over_limit, run_ok):
+    """شمارنده‌ی بررسی‌های پشت‌سرهم بالای حد؛ یوزری که این بار بالای حد نبود صفر می‌شه"""
+    if runtime["auto_disable"]["mode"] == "off":
+        if runtime["strikes"]:
+            runtime["strikes"].clear()
+            save_state()
+        return
+    if not run_ok:
+        return
+    over_names = {u for u, _, _ in over_limit}
+    strikes = runtime["strikes"]
+    for n in over_names:
+        strikes[n] = strikes.get(n, 0) + 1
+    for n in list(strikes):
+        if n not in over_names:
+            del strikes[n]
+    save_state()
+
+
+def _ad_button_row():
+    return {"inline_keyboard": [[{"text": "📋 لیست غیرفعال‌شده‌ها", "callback_data": "ad_list"}]]}
+
+
+def process_auto_disable(over_limit, user_by_name, run_ok, max_allowed):
+    cfg = runtime["auto_disable"]
+    mode = cfg["mode"]
+    if mode == "off":
+        return
+    if not run_ok:
+        tg_send("⚠️ این بار بررسی کامل نبود (خطای زیاد یا یوزرهای ناقص)؛ شمارنده‌ها و غیرفعال‌سازی این دوره نادیده گرفته شد.")
+        return
+    need = cfg["strikes_needed"]
+    exempt = {e.lower() for e in cfg["exempt"]}
+    strikes = runtime["strikes"]
+    fc_map = {u: fc for u, fc, _ in over_limit}
+    candidates = []
+    for n, fc in fc_map.items():
+        if strikes.get(n, 0) < need or n.lower() in exempt or n in runtime["disabled_users"]:
+            continue
+        u = user_by_name.get(n)
+        if not u or u.get("status") != "active":
+            continue
+        candidates.append(n)
+    if not candidates:
+        return
+    candidates.sort(key=lambda n: -fc_map[n])
+
+    if mode == "dry":
+        fresh_ones = [n for n in candidates if strikes.get(n, 0) == need]   # فقط بار اول که به آستانه می‌رسن
+        if fresh_ones:
+            lines = "\n".join(f"• <code>{html.escape(n)}</code> — {fc_map[n]} IP" for n in fresh_ones)
+            tg_send(f"🧪 <b>حالت آزمایشی:</b> این یوزرها الان غیرفعال می‌شدن (بالای حد در {need} بررسی پشت‌سرهم):\n{lines}\n\n"
+                    "برای واقعی شدن، حالت رو روی «فعال» بذار.")
+        return
+
+    if len(candidates) > MAX_AUTO_DISABLE_PER_RUN:
+        tg_send(f"🛑 {len(candidates)} یوزر همزمان واجد شرایط غیرفعال‌سازی بودن که از سقف ایمن ({MAX_AUTO_DISABLE_PER_RUN}) بیشتره؛ "
+                "برای جلوگیری از اشتباه، هیچ‌کدوم غیرفعال نشد. وضعیت رو دستی بررسی کن.")
+        return
+
+    done, failed = [], []
+    for n in candidates:
+        ok, err = panel_set_user_status(n, "disabled")
+        if ok:
+            u = user_by_name[n]
+            runtime["disabled_users"][n] = {"id": u.get("id"), "time": time.time(), "ips": fc_map[n],
+                                            "limit": max_allowed, "strikes": strikes.get(n, need)}
+            strikes.pop(n, None)
+            done.append(n)
+        else:
+            failed.append((n, err))
+    save_state()
+    msg = ""
+    if done:
+        msg += f"🔒 <b>غیرفعال شدن</b> (بالای حد {max_allowed} در {need} بررسی پشت‌سرهم):\n"
+        msg += "\n".join(f"• <code>{html.escape(n)}</code> — {fc_map[n]} IP" for n in done) + "\n"
+    if failed:
+        msg += "\n❌ <b>غیرفعال نشد:</b>\n"
+        msg += "\n".join(f"• <code>{html.escape(n)}</code> — {html.escape(str(e))}" for n, e in failed)
+    tg_send(msg.strip(), reply_markup=_ad_button_row())
+
+
+def _reenable_user(username):
+    """(state, detail): enabled | already | gone | error"""
+    status, err = panel_get_user_status(username)
+    if err:
+        return "error", err
+    if status == "__missing__":
+        runtime["disabled_users"].pop(username, None)
+        return "gone", None
+    if status != "disabled":
+        runtime["disabled_users"].pop(username, None)
+        return "already", status
+    ok, err = panel_set_user_status(username, "active")
+    if ok:
+        runtime["disabled_users"].pop(username, None)
+        runtime["strikes"].pop(username, None)
+        return "enabled", None
+    return "error", err
+
+
+def process_auto_reenable():
+    hours = runtime["auto_disable"]["reenable_hours"]
+    if hours <= 0 or not runtime["disabled_users"]:
+        return
+    now = time.time()
+    due = [n for n, i in list(runtime["disabled_users"].items()) if now - i.get("time", now) >= hours * 3600]
+    if not due:
+        return
+    enabled, errors = [], []
+    for n in due:
+        state, detail = _reenable_user(n)
+        if state == "enabled":
+            enabled.append(n)
+        elif state == "error":
+            errors.append((n, detail))
+    save_state()
+    msg = ""
+    if enabled:
+        msg += f"♻️ <b>فعال‌سازی مجدد خودکار</b> (بعد از {hours} ساعت):\n" + "\n".join(f"• <code>{html.escape(n)}</code>" for n in enabled)
+    if errors:
+        msg += "\n❌ فعال نشد:\n" + "\n".join(f"• <code>{html.escape(n)}</code> — {html.escape(str(e))}" for n, e in errors)
+    if msg.strip():
+        tg_send(msg.strip())
+
+
+# ---------- منوها ----------
+def autodis_keyboard():
+    cfg = runtime["auto_disable"]
+    mode_row = [{"text": ("✓ " if cfg["mode"] == k else "") + v, "callback_data": f"ad_mode:{k}"} for k, v in AD_MODES.items()]
+    n_row = [{"text": ("✓ " if cfg["strikes_needed"] == n else "") + str(n), "callback_data": f"ad_n:{n}"} for n in AD_STRIKE_CHOICES]
+    h_row = [{"text": ("✓ " if cfg["reenable_hours"] == h else "") + ("دستی" if h == 0 else f"{h}س"), "callback_data": f"ad_h:{h}"}
+             for h in AD_REENABLE_CHOICES]
+    return {"inline_keyboard": [
+        mode_row,
+        [{"text": "تعداد بررسی پشت‌سرهم ⬇️", "callback_data": "ad_noop"}], n_row,
+        [{"text": "فعال‌سازی مجدد خودکار ⬇️", "callback_data": "ad_noop"}], h_row,
+        [{"text": f"📋 غیرفعال‌شده‌ها ({len(runtime['disabled_users'])})", "callback_data": "ad_list"},
+         {"text": f"👤 استثناها ({len(cfg['exempt'])})", "callback_data": "ad_ex"}],
+        [{"text": "◀️ بازگشت", "callback_data": "main_menu"}],
+    ]}
+
+
+def handle_autodis_menu(chat_id, note=""):
+    cfg = runtime["auto_disable"]
+    re_txt = "دستی" if cfg["reenable_hours"] == 0 else f"بعد از {cfg['reenable_hours']} ساعت"
+    tg_send(
+        f"{note}🔒 <b>غیرفعال‌سازی خودکار</b>\n"
+        f"وضعیت: {AD_MODES[cfg['mode']]}\n"
+        f"شرط: بالای حد مجاز ({runtime['max_allowed_ips']} IP) در <b>{cfg['strikes_needed']}</b> بررسی پشت‌سرهم\n"
+        f"فعال‌سازی مجدد: {re_txt}\n"
+        f"غیرفعال‌شده‌ی فعلی: {len(runtime['disabled_users'])} | استثنا: {len(cfg['exempt'])}\n\n"
+        "• آزمایشی: فقط اعلام می‌کنه کی غیرفعال می‌شد، بدون تغییر تو پنل.\n"
+        "• فقط یوزرهای «active» غیرفعال می‌شن و فقط همونایی که خود ربات غیرفعال کرده تو لیست می‌مونن.",
+        chat_id=chat_id, reply_markup=autodis_keyboard())
+
+
+def handle_autodis_set(chat_id, kind, value):
+    cfg = runtime["auto_disable"]
+    note = ""
+    if kind == "mode" and value in AD_MODES:
+        cfg["mode"] = value
+        if value == "off":
+            runtime["strikes"].clear()
+        if value == "on":
+            note = "⚠️ حالا یوزرهای متخلف واقعاً غیرفعال می‌شن. (پیشنهاد: اول چند دور تو حالت آزمایشی ببین)\n\n"
+    elif kind == "n" and value.isdigit() and int(value) in AD_STRIKE_CHOICES:
+        cfg["strikes_needed"] = int(value)
+    elif kind == "h" and value.isdigit() and int(value) in AD_REENABLE_CHOICES:
+        cfg["reenable_hours"] = int(value)
+    save_state()
+    handle_autodis_menu(chat_id, note=note)
+
+
+def handle_disabled_list(chat_id, note=""):
+    items = sorted(runtime["disabled_users"].items(), key=lambda kv: -kv[1].get("time", 0))
+    if not items:
+        tg_send(f"{note}📋 هیچ یوزری توسط ربات غیرفعال نشده.", chat_id=chat_id,
+                reply_markup={"inline_keyboard": [[{"text": "◀️ بازگشت", "callback_data": "autodis"}]]})
+        return
+    shown = items[:AD_LIST_MAX_SHOWN]
+    lines = "\n".join(f"{i}. <code>{html.escape(n)}</code> — {info.get('ips', '?')} IP — {fmt_age(info.get('time'))}"
+                      for i, (n, info) in enumerate(shown, 1))
+    more = f"\n... و {len(items) - len(shown)} مورد دیگه" if len(items) > len(shown) else ""
+    btns = [{"text": f"✅ {n[:22]}", "callback_data": f"ad_en:{_name_hash(n)}"} for n, _ in shown]
+    rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
+    rows.append([{"text": "✅ فعال‌سازی همه", "callback_data": "ad_en_all"}])
+    rows.append([{"text": "◀️ بازگشت", "callback_data": "autodis"}])
+    tg_send(f"{note}🔒 <b>غیرفعال‌شده‌ها</b> ({len(items)} یوزر)\n\n{lines}{more}\n\nبرای فعال‌سازی دوباره روی ✅ بزن.",
+            chat_id=chat_id, reply_markup={"inline_keyboard": rows})
+
+
+def _state_text(name, state, detail):
+    n = f"<code>{html.escape(name)}</code>"
+    if state == "enabled":
+        return f"✅ {n} فعال شد."
+    if state == "already":
+        return f"ℹ️ {n} تو پنل از قبل «{html.escape(str(detail))}» بود؛ از لیست حذف شد."
+    if state == "gone":
+        return f"ℹ️ {n} دیگه تو پنل نیست؛ از لیست حذف شد."
+    return f"❌ {n} فعال نشد: {html.escape(str(detail))}"
+
+
+def handle_reenable_one(chat_id, name_hash):
+    name = next((n for n in list(runtime["disabled_users"]) if _name_hash(n) == name_hash), None)
+    if not name:
+        handle_disabled_list(chat_id, note="این مورد دیگه تو لیست نیست.\n\n")
+        return
+    state, detail = _reenable_user(name)
+    save_state()
+    handle_disabled_list(chat_id, note=_state_text(name, state, detail) + "\n\n")
+
+
+def handle_reenable_all(chat_id):
+    names = list(runtime["disabled_users"])
+    results = [_state_text(n, *_reenable_user(n)) for n in names]
+    save_state()
+    summary = "\n".join(results[:40]) + (f"\n... و {len(results) - 40} مورد دیگه" if len(results) > 40 else "")
+    handle_disabled_list(chat_id, note=summary + "\n\n" if summary else "")
+
+
+def exempt_keyboard():
+    rows = [[{"text": "➕ افزودن", "callback_data": "ad_ex_add"}]]
+    btns = [{"text": f"❌ {n[:24]}", "callback_data": f"ad_ex_del:{_name_hash(n)}"} for n in runtime["auto_disable"]["exempt"]]
+    rows += [btns[i:i + 2] for i in range(0, len(btns), 2)]
+    rows.append([{"text": "◀️ بازگشت", "callback_data": "autodis"}])
+    return {"inline_keyboard": rows}
+
+
+def handle_exempt_menu(chat_id, note=""):
+    ex = runtime["auto_disable"]["exempt"]
+    body = ("لیست فعلی:\n" + "\n".join(f"• <code>{html.escape(n)}</code>" for n in ex) + "\n\nبرای حذف، روی ❌ بزن.") if ex else "لیست خالیه."
+    tg_send(f"{note}👤 <b>استثناهای غیرفعال‌سازی</b>\nاین یوزرها هیچ‌وقت خودکار غیرفعال نمی‌شن (هشدار می‌گیرن ولی غیرفعال نمی‌شن).\n\n{body}",
+            chat_id=chat_id, reply_markup=exempt_keyboard())
+
+
+def handle_exempt_add_prompt(chat_id):
+    runtime["pending_action"][chat_id] = "ad_ex_add"
+    tg_send("اسم یوزر(ها) رو بفرست (دقیقاً مثل پنل). چندتا رو با فاصله یا خط جدید جدا کن.", chat_id=chat_id)
+
+
+def handle_exempt_add_reply(chat_id, text):
+    ex = runtime["auto_disable"]["exempt"]
+    added, dup = [], []
+    for tok in re.split(r"[\s,،;]+", text.strip()):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if tok.lower() in {e.lower() for e in ex} or tok.lower() in {a.lower() for a in added}:
+            dup.append(tok)
+        else:
+            added.append(tok)
+    ex.extend(added)
+    if added:
+        save_state()
+    note = ""
+    if added:
+        note += "✅ اضافه شد: " + "، ".join(f"<code>{html.escape(a)}</code>" for a in added) + "\n"
+    if dup:
+        note += "ℹ️ از قبل بود: " + "، ".join(f"<code>{html.escape(d)}</code>" for d in dup) + "\n"
+    handle_exempt_menu(chat_id, note=note + "\n" if note else "")
+
+
+def handle_exempt_delete(chat_id, name_hash):
+    ex = runtime["auto_disable"]["exempt"]
+    name = next((n for n in ex if _name_hash(n) == name_hash), None)
+    if name:
+        ex.remove(name)
+        save_state()
+        handle_exempt_menu(chat_id, note=f"🗑 حذف شد: <code>{html.escape(name)}</code>\n\n")
+    else:
+        handle_exempt_menu(chat_id)
+
+
 def handle_update(update):
 
     if "callback_query" in update:
@@ -1241,6 +1603,28 @@ def handle_update(update):
             handle_whitelist_add_prompt(chat_id)
         elif data.startswith("wl_del:"):
             handle_whitelist_delete(chat_id, data[len("wl_del:"):])
+        elif data == "autodis":
+            handle_autodis_menu(chat_id)
+        elif data == "ad_noop":
+            pass
+        elif data.startswith("ad_mode:"):
+            handle_autodis_set(chat_id, "mode", data.split(":", 1)[1])
+        elif data.startswith("ad_n:"):
+            handle_autodis_set(chat_id, "n", data.split(":", 1)[1])
+        elif data.startswith("ad_h:"):
+            handle_autodis_set(chat_id, "h", data.split(":", 1)[1])
+        elif data == "ad_list":
+            handle_disabled_list(chat_id)
+        elif data.startswith("ad_en:"):
+            threading.Thread(target=handle_reenable_one, args=(chat_id, data.split(":", 1)[1])).start()
+        elif data == "ad_en_all":
+            threading.Thread(target=handle_reenable_all, args=(chat_id,)).start()
+        elif data == "ad_ex":
+            handle_exempt_menu(chat_id)
+        elif data == "ad_ex_add":
+            handle_exempt_add_prompt(chat_id)
+        elif data.startswith("ad_ex_del:"):
+            handle_exempt_delete(chat_id, data.split(":", 1)[1])
         elif data == "main_menu":
             tg_send("منوی اصلی:", chat_id=chat_id, reply_markup=main_menu_keyboard())
 
@@ -1257,6 +1641,8 @@ def handle_update(update):
         if pending in ("setup_url", "setup_username", "setup_password",
                        "set_panel_url", "set_panel_username", "set_panel_password"):
             handle_panel_field_reply(chat_id, pending, text)
+        elif pending == "ad_ex_add":
+            handle_exempt_add_reply(chat_id, text)
         elif pending == "wl_add":
             handle_whitelist_add_reply(chat_id, text)
         elif pending == "set_limit":
