@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import random
+import re
 import sys
 import threading
 import time
@@ -97,6 +98,7 @@ runtime = {
     "check_interval_minutes": DEFAULT_CHECK_INTERVAL_MINUTES,
     "ip_fresh_window_minutes": DEFAULT_IP_FRESH_WINDOW_MINUTES,
     "check_history": [],
+    "ip_whitelist": [],     # قانون‌های لیست سفید IP (پیشوند، IP کامل یا CIDR)
     "pending_action": {},   # chat_id -> "set_limit" | "check_user" | "set_panel_url" | "set_panel_username" | "set_panel_password"
 }
 
@@ -141,6 +143,7 @@ def load_state():
             runtime["check_interval_minutes"] = saved.get("check_interval_minutes", DEFAULT_CHECK_INTERVAL_MINUTES)
             runtime["ip_fresh_window_minutes"] = saved.get("ip_fresh_window_minutes", DEFAULT_IP_FRESH_WINDOW_MINUTES)
             runtime["check_history"] = saved.get("check_history", [])
+            runtime["ip_whitelist"] = saved.get("ip_whitelist", [])
         except Exception:
             pass
 
@@ -157,6 +160,7 @@ def save_state():
                 "check_interval_minutes": runtime["check_interval_minutes"],
                 "ip_fresh_window_minutes": runtime["ip_fresh_window_minutes"],
                 "check_history": runtime["check_history"][-HISTORY_KEEP:],
+                "ip_whitelist": runtime["ip_whitelist"],
             }))
             tmp.replace(STATE_FILE)
     except Exception as e:
@@ -166,6 +170,17 @@ def save_state():
 # ================== ارتباط با پنل ==================
 class PanelNotConfigured(Exception):
     pass
+
+
+token_lock = threading.Lock()
+
+
+def refresh_token_if_stale(old_token: str) -> str:
+    """اگه توکن عوض نشده، یه توکن جدید می‌گیره؛ اگه thread دیگه‌ای قبلاً عوضش کرده همون رو برمی‌گردونه"""
+    with token_lock:
+        if runtime["panel_token"] and runtime["panel_token"] != old_token:
+            return runtime["panel_token"]
+        return get_panel_token(force=True)
 
 
 def get_panel_token(force=False) -> str:
@@ -188,25 +203,64 @@ def get_panel_token(force=False) -> str:
     return token
 
 
+USERS_PAGE_LIMIT = 100
+MAX_USER_LIST_PASSES = 6   # اگه ترتیب صفحه‌بندی پنل ناپایدار بود، حداکثر چند بار لیست رو دوباره بگیر تا همه‌ی یوزرها جمع بشن
+_USERS_STATS = {"raw": 0, "unique": 0, "total": 0, "passes": 0}
+
+
+def _users_page(cfg, headers, offset, sort):
+    params = {"offset": offset, "limit": USERS_PAGE_LIMIT}
+    if sort:
+        params["sort"] = sort
+    resp = HTTP.get(f"{cfg['base_url']}/api/users", headers=headers, params=params, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("users", []), data.get("total")
+
+
+def _users_pass(cfg, headers, sort):
+    """یک دور کامل گرفتن لیست یوزرها (صفحه‌ی اول برای فهمیدن total، بقیه موازی)"""
+    first, total = _users_page(cfg, headers, 0, sort)
+    users = list(first)
+    total = total if isinstance(total, int) else len(first)
+    offsets = list(range(USERS_PAGE_LIMIT, total, USERS_PAGE_LIMIT))
+    if offsets:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+            for batch, _ in ex.map(lambda o: _users_page(cfg, headers, o, sort), offsets):
+                users.extend(batch)
+    return users, total
+
+
 def get_all_users(token: str) -> list:
+    """
+    لیست همه‌ی یوزرها، بدون تکراری (بر اساس id).
+    اگه ترتیب صفحه‌بندی پنل ناپایدار باشه (یوزرهای تکراری/جا‌مونده)، با مرتب‌سازی پایدار و یک دور دوم
+    در جهت معکوس جبران می‌شه.
+    """
     cfg = load_panel_config()
     headers = {"Authorization": f"Bearer {token}"}
-    users, offset, limit = [], 0, 100
-    while True:
-        resp = HTTP.get(
-            f"{cfg['base_url']}/api/users",
-            headers=headers, params={"offset": offset, "limit": limit},
-            timeout=REQUEST_TIMEOUT,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        batch = data.get("users", [])
-        users.extend(batch)
-        total = data.get("total", len(users))
-        offset += limit
-        if offset >= total or not batch:
+    merged, raw, total, passes = {}, 0, 0, 0
+    sorts = ["username", "-username"]
+    for k in range(MAX_USER_LIST_PASSES):
+        sort = sorts[k % len(sorts)] if sorts else None
+        try:
+            users, total = _users_pass(cfg, headers, sort)
+        except requests.exceptions.HTTPError as e:
+            if sort and e.response is not None and e.response.status_code in (400, 422):
+                sorts = []          # sort پشتیبانی نمی‌شه؛ بدون اون ادامه بده
+                users, total = _users_pass(cfg, headers, None)
+            else:
+                raise
+        passes += 1
+        raw += len(users)
+        for u in users:
+            merged[u.get("id", u.get("username"))] = u
+        if len(merged) >= total:
             break
-    return users
+    _USERS_STATS.update(raw=raw, unique=len(merged), total=total, passes=passes)
+    if len(merged) != total or raw != len(merged):
+        log.warning(f"لیست یوزرها: خام={raw} یکتا={len(merged)} total پنل={total} دورها={passes}")
+    return list(merged.values())
 
 
 def parse_iso_to_epoch(ts):
@@ -264,7 +318,7 @@ def _to_epoch(value):
     return v
 
 
-def extract_ip_entries(data) -> dict:
+def _extract_ip_entries_raw(data) -> dict:
     """خروجی: {ip: {"ts": آخرین زمان دیده‌شدن یا None, "nodes": {node_id, ...}}}"""
     entries = {}
 
@@ -312,6 +366,71 @@ def extract_ip_entries(data) -> dict:
     return entries
 
 
+# ================== لیست سفید IP ==================
+def parse_whitelist_entry(raw):
+    """ورودی کاربر رو به یه قانون استاندارد تبدیل می‌کنه (یا None اگه نامعتبر بود).
+    نمونه‌ها: 140.248  |  140.248.74.  |  140.248.*  |  1.2.3.4  |  10.0.0.0/8  |  2001:db8"""
+    s = (raw or "").strip().lower().replace("*", "").rstrip(".")
+    if not s:
+        return None
+    if "/" in s:
+        try:
+            return str(ipaddress.ip_network(s, strict=False))
+        except ValueError:
+            return None
+    if ":" in s:
+        if not re.fullmatch(r"[0-9a-f:]+", s):
+            return None
+        try:
+            return normalize_ip(str(ipaddress.ip_address(s)))   # آدرس کامل IPv6 -> /64
+        except ValueError:
+            return s.rstrip(":") if s.rstrip(":") else None      # پیشوند IPv6
+    parts = s.split(".")
+    if 1 <= len(parts) <= 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+        return ".".join(str(int(p)) for p in parts)
+    return None
+
+
+def fmt_whitelist_rule(rule: str) -> str:
+    if "/" in rule or ":" in rule:
+        return rule
+    return rule if rule.count(".") == 3 else rule + ".*"
+
+
+def ip_whitelisted(ip: str, rules) -> bool:
+    for r in rules:
+        if "/" in r:
+            try:
+                net = ipaddress.ip_network(r, strict=False)
+                addr = ipaddress.ip_address(ip.split("/")[0])
+                if addr.version == net.version and addr in net:
+                    return True
+            except ValueError:
+                continue
+        elif ":" in r:
+            try:
+                ip_hex = ipaddress.ip_address(ip.split("/")[0]).exploded.split(":")
+            except ValueError:
+                continue
+            rule_hex = [h.zfill(4) for h in r.split(":") if h]
+            if ip_hex[:len(rule_hex)] == rule_hex:
+                return True
+        elif ":" not in ip:
+            parts = r.split(".")
+            if ip.split(".")[:len(parts)] == parts:
+                return True
+    return False
+
+
+def extract_ip_entries(data) -> dict:
+    """IPهای هر یوزر (بدون IPهای لیست سفید)"""
+    entries = _extract_ip_entries_raw(data)
+    rules = runtime.get("ip_whitelist") or []
+    if rules:
+        entries = {ip: e for ip, e in entries.items() if not ip_whitelisted(ip, rules)}
+    return entries
+
+
 def split_fresh(entries: dict, window_seconds: float, now=None) -> dict:
     """فقط IPهایی که تو بازه‌ی window_seconds دیده شدن (IP بدون زمان، تازه حساب می‌شه)"""
     now = now or time.time()
@@ -355,6 +474,7 @@ def try_get_user_ip_data(token: str, user_id, username: str, probe=False):
         attempts = 1
 
     results = []
+    refreshed = False
     for template in candidates:
         url = f"{cfg['base_url']}{template.format(id=user_id, username=username)}"
         for attempt in range(attempts):
@@ -366,6 +486,15 @@ def try_get_user_ip_data(token: str, user_id, username: str, probe=False):
                     time.sleep(1)
                 continue
             results.append((template, resp.status_code, resp.text[:500]))
+            if resp.status_code == 401 and not refreshed:
+                refreshed = True
+                try:
+                    headers = {"Authorization": f"Bearer {refresh_token_if_stale(token)}"}
+                    resp = HTTP.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+                    results.append((template, resp.status_code, resp.text[:500]))
+                except Exception as e:
+                    results.append((template, None, f"خطا در تمدید توکن: {e}"))
+                    break
             if resp.status_code == 200:
                 if runtime["working_endpoint"] != template:
                     runtime["working_endpoint"] = template
@@ -417,8 +546,71 @@ def main_menu_keyboard():
              {"text": "🧪 تست اتصال API", "callback_data": "test_api"}],
             [{"text": "ℹ️ وضعیت", "callback_data": "status"},
              {"text": "🛠 تنظیمات پنل", "callback_data": "panel_menu"}],
+            [{"text": "🛡 لیست سفید IP", "callback_data": "whitelist"}],
         ]
     }
+
+
+def whitelist_keyboard():
+    rules = runtime["ip_whitelist"]
+    rows = [[{"text": "➕ افزودن", "callback_data": "wl_add"}]]
+    btns = [{"text": f"❌ {fmt_whitelist_rule(r)}", "callback_data": f"wl_del:{r}"} for r in rules]
+    for i in range(0, len(btns), 2):
+        rows.append(btns[i:i + 2])
+    rows.append([{"text": "◀️ بازگشت", "callback_data": "main_menu"}])
+    return {"inline_keyboard": rows}
+
+
+def handle_whitelist_menu(chat_id, note=""):
+    rules = runtime["ip_whitelist"]
+    if rules:
+        body = "\n".join(f"• <code>{html.escape(fmt_whitelist_rule(r))}</code>" for r in rules)
+        body = "لیست فعلی:\n" + body + "\n\nبرای حذف، روی ❌ مورد نظر بزن."
+    else:
+        body = "لیست خالیه."
+    tg_send(f"{note}🛡 <b>لیست سفید IP</b>\nIPهای این لیست تو شمارش یوزرها حساب نمی‌شن.\n\n{body}",
+            chat_id=chat_id, reply_markup=whitelist_keyboard())
+
+
+def handle_whitelist_add_prompt(chat_id):
+    runtime["pending_action"][chat_id] = "wl_add"
+    tg_send("IP یا پیشوند رو بفرست. چندتا رو می‌تونی با فاصله یا خط جدید جدا کنی.\n\n"
+            "مثال:\n<code>140.248</code>  (کل رنج 140.248.*.*)\n<code>140.248.74</code>  (کل 140.248.74.*)\n"
+            "<code>1.2.3.4</code>  (فقط یه IP)\n<code>10.0.0.0/8</code>  (CIDR)", chat_id=chat_id)
+
+
+def handle_whitelist_add_reply(chat_id, text):
+    added, dup, bad = [], [], []
+    for tok in re.split(r"[\s,،;]+", text.strip()):
+        if not tok:
+            continue
+        rule = parse_whitelist_entry(tok)
+        if rule is None:
+            bad.append(tok)
+        elif rule in runtime["ip_whitelist"] or rule in added:
+            dup.append(rule)
+        else:
+            added.append(rule)
+    runtime["ip_whitelist"].extend(added)
+    if added:
+        save_state()
+    note = ""
+    if added:
+        note += "✅ اضافه شد: " + "، ".join(f"<code>{html.escape(fmt_whitelist_rule(r))}</code>" for r in added) + "\n"
+    if dup:
+        note += "ℹ️ از قبل بود: " + "، ".join(f"<code>{html.escape(fmt_whitelist_rule(r))}</code>" for r in dup) + "\n"
+    if bad:
+        note += "❌ نامعتبر: " + "، ".join(f"<code>{html.escape(b)}</code>" for b in bad) + "\n"
+    handle_whitelist_menu(chat_id, note=note + "\n" if note else "")
+
+
+def handle_whitelist_delete(chat_id, rule):
+    if rule in runtime["ip_whitelist"]:
+        runtime["ip_whitelist"].remove(rule)
+        save_state()
+        handle_whitelist_menu(chat_id, note=f"🗑 حذف شد: <code>{html.escape(fmt_whitelist_rule(rule))}</code>\n\n")
+    else:
+        handle_whitelist_menu(chat_id)
 
 
 def panel_menu_keyboard():
@@ -563,7 +755,7 @@ def send_alert_batches(to_alert, max_allowed, window):
     if not to_alert:
         return
     to_alert.sort(key=lambda x: -x[1])
-    detail = len(to_alert) <= 5
+    detail = False   # لیست IPها تو هشدار نمایش داده نمی‌شه (برای دیدنش از /raw یا «بررسی یوزر خاص» استفاده کن)
     ref = _ONLINE_REF[0] or time.time()
     header = (f"⚠️ <b>هشدار تعداد IP بالا</b> ({len(to_alert)} یوزر)\n"
               f"حد مجاز: <b>{max_allowed}</b> | بازه اعتبار IP: {window // 60} دقیقه\n"
@@ -588,11 +780,35 @@ def send_alert_batches(to_alert, max_allowed, window):
         tg_send(chunk)
 
 
+check_lock = threading.Lock()
+
+
 def run_check(notify_chat_id=None):
+    """فقط یک بررسی همزمان اجرا می‌شه (بررسی دستی و خودکار با هم قاطی نشن)"""
+    if not check_lock.acquire(blocking=False):
+        if notify_chat_id:
+            tg_send("⏳ یه بررسی هم‌اکنون در حال اجراست؛ بعد از تموم شدنش دوباره امتحان کن.", chat_id=notify_chat_id)
+        else:
+            log.info("بررسی قبلی هنوز تموم نشده؛ این نوبت رد شد.")
+        return
+    try:
+        _run_check_impl(notify_chat_id)
+    finally:
+        check_lock.release()
+
+
+def _run_check_impl(notify_chat_id=None):
     started = time.time()
     try:
         token = get_panel_token()
-        users = get_all_users(token)
+        try:
+            users = get_all_users(token)
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 401:
+                token = refresh_token_if_stale(token)
+                users = get_all_users(token)
+            else:
+                raise
     except PanelNotConfigured:
         tg_send("⚠️ پنل هنوز تنظیم نشده. از «🛠 تنظیمات پنل» استفاده کن.", chat_id=notify_chat_id)
         return
@@ -638,14 +854,8 @@ def run_check(notify_chat_id=None):
                 if err2 or fresh2 is None:
                     continue
                 fresh1, total1 = results[uname]
-                # IPهایی که در هر دو بار تازه بودن (اشتراک) + اگه تعدادشون از حد کمتره، ردش کن
-                common = {ip: e for ip, e in fresh1.items() if ip in fresh2}
-                # اگه هیچ IP مشترکی نیست یعنی داده‌ی لحظه‌ای پایدار نیست؛ کمینه‌ی دو شمارش رو ملاک بگیر
-                if len(common) < min(len(fresh1), len(fresh2)):
-                    keep = fresh1 if len(fresh1) <= len(fresh2) else fresh2
-                else:
-                    keep = common
-                results[uname] = (keep if len(keep) <= len(fresh1) else fresh1, total1)
+                # ملاک، کمینه‌ی دو شمارش (محتاطانه): اگه تو بار دوم کمتر شد، همون کمتر ملاکه
+                results[uname] = (fresh1 if len(fresh1) <= len(fresh2) else fresh2, total1)
 
     now = time.time()
     over_limit, to_alert = [], []
@@ -677,7 +887,10 @@ def run_check(notify_chat_id=None):
     save_state()
 
     if notify_chat_id:
-        footer = (f"\n\n👥 کل یوزرها: {total_users} | آنلاین (online_at ≤ {ONLINE_WINDOW_SECONDS // 60} دقیقه): {online_candidates}"
+        incomplete = " ⚠️ ناقص" if len(results) < online_candidates else ""
+        footer = (f"\n\n👥 کل یوزرها: {total_users} (پنل: {_USERS_STATS['total']}) | "
+                  f"آنلاین (online_at ≤ {ONLINE_WINDOW_SECONDS // 60} دقیقه): {online_candidates}"
+                  f"\n✅ چک‌شده: {len(results)} از {online_candidates}{incomplete}"
                   f"\n⏱ مدت: {duration} ثانیه | خطا: {errors} | بازه اعتبار IP: {window // 60} دقیقه")
         if over_limit:
             over_limit.sort(key=lambda x: -x[1])
@@ -970,6 +1183,99 @@ def handle_sample_analysis(chat_id):
 
 
 # ================== حلقه polling تلگرام ==================
+def handle_update(update):
+
+    if "callback_query" in update:
+        cq = update["callback_query"]
+        chat_id = cq["message"]["chat"]["id"]
+        if chat_id != OWNER_CHAT_ID:
+            tg_answer_callback(cq["id"], "⛔ این ربات فقط برای مالک اصلی کار می‌کنه.")
+            return
+        data = cq.get("data")
+        tg_answer_callback(cq["id"])
+
+        if data == "check_now":
+            tg_send("در حال بررسی...", chat_id=chat_id)
+            threading.Thread(target=run_check, kwargs={"notify_chat_id": chat_id}).start()
+        elif data == "test_api":
+            threading.Thread(target=handle_test_api, args=(chat_id,)).start()
+        elif data == "status":
+            handle_status(chat_id)
+        elif data == "history":
+            handle_history(chat_id)
+        elif data == "set_limit":
+            handle_set_limit_prompt(chat_id)
+        elif data == "set_interval":
+            handle_set_interval_prompt(chat_id)
+        elif data.startswith("interval_"):
+            val = int(data.split("_")[1])
+            runtime["pending_action"].pop(chat_id, None)
+            runtime["check_interval_minutes"] = val
+            save_state()
+            tg_send(f"✅ فاصله‌ی بررسی خودکار روی هر {val} دقیقه تنظیم شد.", chat_id=chat_id, reply_markup=main_menu_keyboard())
+        elif data == "check_user":
+            handle_check_user_prompt(chat_id)
+        elif data == "set_fresh":
+            handle_set_fresh_prompt(chat_id)
+        elif data.startswith("fresh_"):
+            runtime["pending_action"].pop(chat_id, None)
+            _apply_fresh(chat_id, int(data.split("_")[1]))
+        elif data == "sample":
+            threading.Thread(target=handle_sample_analysis, args=(chat_id,)).start()
+        elif data == "panel_menu":
+            handle_panel_menu(chat_id)
+        elif data == "panel_show":
+            handle_panel_show(chat_id)
+        elif data == "set_panel_url":
+            runtime["pending_action"][chat_id] = "set_panel_url"
+            tg_send("آدرس پنل رو بفرست (مثلاً: https://panel.example.com یا با پورت: https://panel.example.com:2096)", chat_id=chat_id)
+        elif data == "set_panel_username":
+            runtime["pending_action"][chat_id] = "set_panel_username"
+            tg_send("یوزرنیم ادمین پنل رو بفرست:", chat_id=chat_id)
+        elif data == "set_panel_password":
+            runtime["pending_action"][chat_id] = "set_panel_password"
+            tg_send("پسورد ادمین پنل رو بفرست:", chat_id=chat_id)
+        elif data == "whitelist":
+            handle_whitelist_menu(chat_id)
+        elif data == "wl_add":
+            handle_whitelist_add_prompt(chat_id)
+        elif data.startswith("wl_del:"):
+            handle_whitelist_delete(chat_id, data[len("wl_del:"):])
+        elif data == "main_menu":
+            tg_send("منوی اصلی:", chat_id=chat_id, reply_markup=main_menu_keyboard())
+
+    elif "message" in update:
+        msg = update["message"]
+        chat_id = msg["chat"]["id"]
+        text = (msg.get("text") or "").strip()
+
+        if chat_id != OWNER_CHAT_ID:
+            log.info(f"پیام از چت غیرمجاز نادیده گرفته شد: {chat_id}")
+            return
+
+        pending = runtime["pending_action"].pop(chat_id, None)
+        if pending in ("setup_url", "setup_username", "setup_password",
+                       "set_panel_url", "set_panel_username", "set_panel_password"):
+            handle_panel_field_reply(chat_id, pending, text)
+        elif pending == "wl_add":
+            handle_whitelist_add_reply(chat_id, text)
+        elif pending == "set_limit":
+            handle_set_limit_reply(chat_id, text)
+        elif pending == "set_interval":
+            handle_set_interval_reply(chat_id, text)
+        elif pending == "set_fresh":
+            handle_set_fresh_reply(chat_id, text)
+        elif pending == "check_user":
+            threading.Thread(target=handle_check_user_reply, args=(chat_id, text)).start()
+        elif text.startswith("/raw "):
+            threading.Thread(target=handle_raw, args=(chat_id, text[5:])).start()
+        elif text in ("/start", "/menu"):
+            if not panel_is_configured():
+                start_panel_setup_wizard(chat_id)
+            else:
+                tg_send("سلام! منوی مدیریت مانیتور IP:", chat_id=chat_id, reply_markup=main_menu_keyboard())
+
+
 def telegram_polling_loop():
     offset = 0
     while True:
@@ -983,88 +1289,10 @@ def telegram_polling_loop():
 
         for update in updates:
             offset = update["update_id"] + 1
-
-            if "callback_query" in update:
-                cq = update["callback_query"]
-                chat_id = cq["message"]["chat"]["id"]
-                if chat_id != OWNER_CHAT_ID:
-                    tg_answer_callback(cq["id"], "⛔ این ربات فقط برای مالک اصلی کار می‌کنه.")
-                    continue
-                data = cq.get("data")
-                tg_answer_callback(cq["id"])
-
-                if data == "check_now":
-                    tg_send("در حال بررسی...", chat_id=chat_id)
-                    threading.Thread(target=run_check, kwargs={"notify_chat_id": chat_id}).start()
-                elif data == "test_api":
-                    threading.Thread(target=handle_test_api, args=(chat_id,)).start()
-                elif data == "status":
-                    handle_status(chat_id)
-                elif data == "history":
-                    handle_history(chat_id)
-                elif data == "set_limit":
-                    handle_set_limit_prompt(chat_id)
-                elif data == "set_interval":
-                    handle_set_interval_prompt(chat_id)
-                elif data.startswith("interval_"):
-                    val = int(data.split("_")[1])
-                    runtime["pending_action"].pop(chat_id, None)
-                    runtime["check_interval_minutes"] = val
-                    save_state()
-                    tg_send(f"✅ فاصله‌ی بررسی خودکار روی هر {val} دقیقه تنظیم شد.", chat_id=chat_id, reply_markup=main_menu_keyboard())
-                elif data == "check_user":
-                    handle_check_user_prompt(chat_id)
-                elif data == "set_fresh":
-                    handle_set_fresh_prompt(chat_id)
-                elif data.startswith("fresh_"):
-                    runtime["pending_action"].pop(chat_id, None)
-                    _apply_fresh(chat_id, int(data.split("_")[1]))
-                elif data == "sample":
-                    threading.Thread(target=handle_sample_analysis, args=(chat_id,)).start()
-                elif data == "panel_menu":
-                    handle_panel_menu(chat_id)
-                elif data == "panel_show":
-                    handle_panel_show(chat_id)
-                elif data == "set_panel_url":
-                    runtime["pending_action"][chat_id] = "set_panel_url"
-                    tg_send("آدرس پنل رو بفرست (مثلاً: https://panel.example.com یا با پورت: https://panel.example.com:2096)", chat_id=chat_id)
-                elif data == "set_panel_username":
-                    runtime["pending_action"][chat_id] = "set_panel_username"
-                    tg_send("یوزرنیم ادمین پنل رو بفرست:", chat_id=chat_id)
-                elif data == "set_panel_password":
-                    runtime["pending_action"][chat_id] = "set_panel_password"
-                    tg_send("پسورد ادمین پنل رو بفرست:", chat_id=chat_id)
-                elif data == "main_menu":
-                    tg_send("منوی اصلی:", chat_id=chat_id, reply_markup=main_menu_keyboard())
-
-            elif "message" in update:
-                msg = update["message"]
-                chat_id = msg["chat"]["id"]
-                text = (msg.get("text") or "").strip()
-
-                if chat_id != OWNER_CHAT_ID:
-                    log.info(f"پیام از چت غیرمجاز نادیده گرفته شد: {chat_id}")
-                    continue
-
-                pending = runtime["pending_action"].pop(chat_id, None)
-                if pending in ("setup_url", "setup_username", "setup_password",
-                               "set_panel_url", "set_panel_username", "set_panel_password"):
-                    handle_panel_field_reply(chat_id, pending, text)
-                elif pending == "set_limit":
-                    handle_set_limit_reply(chat_id, text)
-                elif pending == "set_interval":
-                    handle_set_interval_reply(chat_id, text)
-                elif pending == "set_fresh":
-                    handle_set_fresh_reply(chat_id, text)
-                elif pending == "check_user":
-                    threading.Thread(target=handle_check_user_reply, args=(chat_id, text)).start()
-                elif text.startswith("/raw "):
-                    threading.Thread(target=handle_raw, args=(chat_id, text[5:])).start()
-                elif text in ("/start", "/menu"):
-                    if not panel_is_configured():
-                        start_panel_setup_wizard(chat_id)
-                    else:
-                        tg_send("سلام! منوی مدیریت مانیتور IP:", chat_id=chat_id, reply_markup=main_menu_keyboard())
+            try:
+                handle_update(update)
+            except Exception:
+                log.exception("خطا در پردازش پیام تلگرام")
 
 
 # ================== حلقه چک خودکار پس‌زمینه ==================
@@ -1073,7 +1301,10 @@ def background_check_loop():
         time.sleep(runtime["check_interval_minutes"] * 60)
         if panel_is_configured():
             log.info("اجرای بررسی خودکار دوره‌ای...")
-            run_check()
+            try:
+                run_check()
+            except Exception:
+                log.exception("خطا در بررسی خودکار")
         else:
             log.info("پنل تنظیم نشده، بررسی خودکار رد شد.")
 
